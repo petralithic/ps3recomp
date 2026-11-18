@@ -2591,10 +2591,13 @@ static void vk_window_drop(const char* why)
     }
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
+#ifdef __APPLE__
     if (s_vk.window) SDL_DestroyWindow(s_vk.window);
     if (s_vk.windowed) {
-#ifdef __APPLE__
         SDL_Vulkan_UnloadLibrary();
+#else
+    if (s_vk.window) {
+        SDL_DestroyWindow(s_vk.window);
 #endif
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
     }
