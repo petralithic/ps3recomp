@@ -1859,12 +1859,12 @@ static u32 eng_zdepth_snapshot(u32 slot)
  * and effect pass after it; over open sky (depth 1.0) the copy said 0, and
  * all of them failed their depth test there: the Aphelion's blaster bolts
  * were invisible until they flew in front of something. */
+/* This full-screen quad carries only ATTR0; no colour/texcoord inputs. */
+static const char* const kEngDepthAsColorVS =
+"float4 main(float4 a0 : ATTR0) : SV_Position { return a0; }\n";
 static const char* const kEngDepthAsColorPS =
 "struct PSInput {\n"
-"    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"
-"    float4 fog : FOG;\n"
-"    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
-"    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
+"    float4 position : SV_POSITION;\n"
 "};\n"
 "Texture2D    rsx_tex[16] : register(t0);\n"
 "SamplerState rsx_samp[16] : register(s0);\n"
@@ -1917,7 +1917,7 @@ static u32 eng_zdepth_as_color(u32 slot)
     memset(&rs, 0, sizeof rs);
     rs.color_mask = 0x01010101u;
     if (!s_d2c_pipe) {
-        s_d2c_pipe = g.be->pipeline_create(g.be->user, kEngFixedVS, kEngDepthAsColorPS, &rs, &lp,
+        s_d2c_pipe = g.be->pipeline_create(g.be->user, kEngDepthAsColorVS, kEngDepthAsColorPS, &rs, &lp,
                                            lp.stride, RSX_BE_FMT_R8G8B8A8, 1u);
         if (!s_d2c_pipe) {
             s_d2c_pipe = ENG_INVALID;
