@@ -1108,6 +1108,7 @@ extern "C" void ppu_report_guest_lrs(void);
 /* Each host thread's CPU time (kernel + user, 100 ns) when the stacks were
  * taken, for ppu_stall_cpu_report: which threads ran through the rest of the
  * freeze and which only waited. */
+#ifdef _WIN32
 static DWORD s_stall_tid[512]; static unsigned long long s_stall_cpu[512]; static unsigned s_stall_n;
 static unsigned long long ppu_thread_cpu(HANDLE h)
 {
@@ -1241,11 +1242,15 @@ static DWORD WINAPI ppu_stall_probe(LPVOID)
     return 0;
 }
 
+#endif /* Windows host-stack diagnostics */
+
 extern "C" void ppu_resv_register(ppu_context* c)
 {
     if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
+#ifdef _WIN32
     { static LONG once; const char* e = getenv("RACACIT_STALL_PROBE");
       if (!(e && *e == '0') && !InterlockedExchange(&once, 1)) CreateThread(NULL, 0, ppu_stall_probe, NULL, 0, NULL); }
+#endif
     /* Once per context. Contexts are the thread table's own slots, reused by
      * every thread that takes the slot, and A Crack in Time creates a thread
      * per autosave and per async load (50 in the owner's 9 minutes): appending
