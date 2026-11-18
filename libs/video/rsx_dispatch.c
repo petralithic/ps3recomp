@@ -430,7 +430,12 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
         (method >= 0x0A80 && method < 0x0B00))
         vtx_const_fold(rsx, method, arg);
-    if (rsx->in_begin_end && imm_is_attr0_last_word(method))
+    /* RACiT's immediate-mode emulation (an inline stream built at END) only
+     * for a sink without upstream's immediate_vertex hook: with both, every
+     * immediate draw arrived as immediate AND inline geometry and the draw
+     * engine rejected it as mixed -- A Crack in Time's post-process and
+     * final composite quads, so a level never replaced the LOADING screen. */
+    if (rsx->in_begin_end && !rsx->sink.immediate_vertex && imm_is_attr0_last_word(method))
         imm_emit_vertex(rsx);
 
     /* Completing a position emits a register-based vertex: the last word of
