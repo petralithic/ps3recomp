@@ -372,6 +372,18 @@ void ps3_tl(char ev, uint32_t a, uint32_t b)
     ps3_tl_at(ps3_qpc_us(), ev, a, b);
 }
 
+#ifndef _WIN32
+#include <unistd.h>
+int racacit_few_cpus(void)
+{
+    static int few = -1;
+    if (few < 0) {
+        long count = sysconf(_SC_NPROCESSORS_ONLN);
+        few = count > 0 && count < 16;
+    }
+    return few;
+}
+#endif
 #ifdef _WIN32
 /* Under 16 CPU threads the runtime stops spinning where it can: see the callers. */
 int racacit_few_cpus(void)

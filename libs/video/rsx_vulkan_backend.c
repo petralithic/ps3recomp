@@ -273,9 +273,22 @@ static void vk_device_lost_report(VkResult r);
 /* ---------------------------------------------------------------------------
  * Loading
  * -------------------------------------------------------------------------*/
+#ifdef __APPLE__
+#ifndef PS3RECOMP_VULKAN_LOADER_PATH
+#define PS3RECOMP_VULKAN_LOADER_PATH "libvulkan.1.dylib"
+#endif
+static const char* vk_apple_loader(void)
+{
+    const char* configured = getenv("PS3RECOMP_VULKAN_LIBRARY");
+    return configured && *configured ? configured : PS3RECOMP_VULKAN_LOADER_PATH;
+}
+#endif
+
 static int vk_load_library(void)
 {
-#ifdef _WIN32
+#if defined(__APPLE__)
+    const char* names[] = { vk_apple_loader(), "libvulkan.dylib" };
+#elif defined(_WIN32)
     static const char* names[] = { "vulkan-1.dll" };
 #else
     static const char* names[] = { "libvulkan.so.1", "libvulkan.so" };
@@ -283,7 +296,7 @@ static int vk_load_library(void)
     for (size_t i = 0; i < sizeof names / sizeof names[0] && !s_vk.lib; i++)
         s_vk.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
     if (!s_vk.lib) {
-        VK_LOG("no Vulkan loader found (dlopen libvulkan.so.1: %s)\n", dlerror());
+        VK_LOG("no Vulkan loader found: %s\n", dlerror());
         return -1;
     }
     pvkGetInstanceProcAddr =
@@ -2578,8 +2591,11 @@ static void vk_window_drop(const char* why)
     }
     if (s_vk.surface && s_vk.instance && pvkDestroySurfaceKHR)
         pvkDestroySurfaceKHR(s_vk.instance, s_vk.surface, NULL);
-    if (s_vk.window) {
-        SDL_DestroyWindow(s_vk.window);
+    if (s_vk.window) SDL_DestroyWindow(s_vk.window);
+    if (s_vk.windowed) {
+#ifdef __APPLE__
+        SDL_Vulkan_UnloadLibrary();
+#endif
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
     }
     s_vk.window = NULL;
@@ -2598,6 +2614,14 @@ static void vk_window_open(const char* title)
         VK_LOG("window disabled, continuing headless: SDL video init failed: %s\n", SDL_GetError());
         return;
     }
+#ifdef __APPLE__
+    /* SDL and the renderer must use the same Vulkan loader. */
+    if (SDL_Vulkan_LoadLibrary(vk_apple_loader()) != 0) {
+        VK_LOG("Vulkan loader failed: %s\n", SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        return;
+    }
+#endif
     /* Controllers, if cellPadInit has not started them already (it usually
      * has: the game calls it before the window opens -- v79 meant this to be
      * the place, and the owner's 0.8 log showed it is not). Same hints as
@@ -6733,11 +6757,35 @@ static int vk_init_all(u32 width, u32 height, const char* title)
         ci.enabledExtensionCount   = s_vk.inst_ext_count;
         ci.ppEnabledExtensionNames = s_vk.inst_exts;
     }
+#ifdef __APPLE__
+    const char* apple_extensions[18];
+    unsigned apple_count = ci.enabledExtensionCount;
+    for (unsigned i = 0; i < apple_count; ++i)
+        apple_extensions[i] = ci.ppEnabledExtensionNames[i];
+    const char* portability_extensions[] = {
+        VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
+        VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME
+    };
+    for (unsigned i = 0; i < 2; ++i) {
+        int present = 0;
+        for (unsigned j = 0; j < apple_count; ++j)
+            if (!strcmp(apple_extensions[j], portability_extensions[i])) present = 1;
+        if (!present) apple_extensions[apple_count++] = portability_extensions[i];
+    }
+    ci.enabledExtensionCount = apple_count;
+    ci.ppEnabledExtensionNames = apple_extensions;
+    ci.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+#endif
     VkResult ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
     if (ir != VK_SUCCESS && s_vk.windowed) {
         vk_window_drop("vkCreateInstance with the surface extensions failed");
+#ifdef __APPLE__
+        ci.enabledExtensionCount = 2;
+        ci.ppEnabledExtensionNames = portability_extensions;
+#else
         ci.enabledExtensionCount = 0;
         ci.ppEnabledExtensionNames = NULL;
+#endif
         ir = pvkCreateInstance(&ci, NULL, &s_vk.instance);
     }
     if (ir != VK_SUCCESS) { VK_LOG("vkCreateInstance failed (VkResult %d)\n", (int)ir); return -1; }
@@ -6785,7 +6833,11 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     VkDeviceQueueCreateInfo qci = { .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
                                     .queueFamilyIndex = s_vk.queue_family,
                                     .queueCount = 1, .pQueuePriorities = &prio };
-    const char* dev_exts[4]; u32 n_dev_exts = 0;
+    const char* dev_exts[5]; u32 n_dev_exts = 0;
+#ifdef __APPLE__
+    if (vk_has_device_extension(s_vk.phys, "VK_KHR_portability_subset"))
+        dev_exts[n_dev_exts++] = "VK_KHR_portability_subset";
+#endif
     if (s_vk.windowed) dev_exts[n_dev_exts++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     const int fault_ext = vk_has_device_extension(s_vk.phys, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     VkPhysicalDeviceFaultFeaturesEXT fault_feat = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT,

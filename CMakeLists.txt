@@ -47,12 +47,9 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
 if(PS3RECOMP_RSX_VULKAN)
-    if(APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN: use the Metal backend on Apple")
-    endif()
     find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
         message(FATAL_ERROR "Vulkan headers not found. Debian/Ubuntu: "
@@ -209,6 +206,14 @@ endif()
 
 if(PS3RECOMP_RSX_VULKAN)
     target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_VULKAN_INCLUDE_DIR}")
+    if(APPLE)
+        find_library(PS3RECOMP_VULKAN_LOADER NAMES vulkan vulkan.1
+            HINTS "$ENV{VULKAN_SDK}" PATH_SUFFIXES lib)
+        if(PS3RECOMP_VULKAN_LOADER)
+            target_compile_definitions(ps3recomp_runtime PRIVATE
+                PS3RECOMP_VULKAN_LOADER_PATH="${PS3RECOMP_VULKAN_LOADER}")
+        endif()
+    endif()
     # PUBLIC: ps3recomp_host selects its backend on this definition.
     target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
     target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
