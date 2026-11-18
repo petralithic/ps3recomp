@@ -30,7 +30,13 @@ uint32_t g_sys_mem_bump_ptr = 0;
 #define SYS_MEM_ALLOC_END   0x20000000u
 #define SYS_MAPPER_BASE     0x40000000u
 #define SYS_MAPPER_END      0xC0000000u
-static uint32_t s_mapper_bump_ptr = SYS_MAPPER_BASE;
+/* Where sys_mmapper_allocate_address starts handing out regions. A port that
+ * knows its title's memory map may move it before any guest code runs, like
+ * ppu_hle_inject_base (RACiT: the title's 256 MB heap reservation has always
+ * landed at 0x20000000, and its write-watch ranges and memory scans expect it
+ * there). 0 in the cursor means "not yet used: start here". */
+uint32_t sys_mapper_base = SYS_MAPPER_BASE;
+static uint32_t s_mapper_bump_ptr = 0;
 typedef struct mapper_reservation {
     uint32_t start, end, next;
 } mapper_reservation;
@@ -370,7 +376,7 @@ static uint32_t mapper_address(uint64_t requested, uint64_t alignment)
 {
     if (!requested || requested > UINT32_MAX || !alignment ||
         alignment > UINT32_MAX || (alignment & (alignment - 1u))) return 0;
-    uint64_t addr = ((uint64_t)s_mapper_bump_ptr + alignment - 1u) & ~(alignment - 1u);
+    uint64_t addr = ((uint64_t)(s_mapper_bump_ptr ? s_mapper_bump_ptr : sys_mapper_base) + alignment - 1u) & ~(alignment - 1u);
     uint64_t size = (requested + alignment - 1u) & ~(alignment - 1u);
     /* A reservation owns its entire aligned span. Recheck after every skip:
      * an alignment adjustment can move it into another runtime-owned window. */
@@ -595,7 +601,7 @@ void sys_memory_init(lv2_syscall_table* tbl)
     memset(g_sys_mmapper_shared, 0, sizeof(g_sys_mmapper_shared));
     g_sys_mem_bump_ptr = 0;
     s_total_allocated  = 0;
-    s_mapper_bump_ptr = SYS_MAPPER_BASE;
+    s_mapper_bump_ptr = 0;
     memset(s_mapper_reservations, 0, sizeof(s_mapper_reservations));
     bump_unlock();
 
