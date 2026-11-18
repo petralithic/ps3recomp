@@ -69,6 +69,7 @@ static int vk_make_dummy_cube(void);
  * opens the optional window. Same include style as those two. */
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_vulkan.h>
+#include <stdio.h>
 
 #ifdef _WIN32
 /* The loader is vulkan-1.dll; a tiny dlopen shim keeps one loading path. */
@@ -92,7 +93,6 @@ static const char* dlerror(void)
 #endif
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
