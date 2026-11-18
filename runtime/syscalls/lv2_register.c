@@ -311,6 +311,7 @@ typedef struct {
     spu_thread_handle_t host_thread;
     spu_thread_event_t  finish_event;
     int                 running;
+    int                 host_live;   /* host_thread spawned and not yet closed / joined */
     spu_ppu_fallback_fn fb_handler;
     void*               fb_user;
     /* Live spu_context while a lifted worker is running on its host thread
@@ -706,6 +707,33 @@ static void spu_spawn_host_thread(spu_thread_handle_t* out,
 }
 #endif
 
+/* The host thread of an SPU thread's last run, done with: its handle closed
+ * (Windows) or the thread joined (POSIX; detached when not waiting). group_join
+ * used to do this only for a thread still running when the guest joined it,
+ * but both thread procs clear `running` as they finish -- so every thread that
+ * was already done kept its handle and kernel thread object until the next
+ * start overwrote the handle, and on POSIX was never joined at all: its whole
+ * stack reservation stayed mapped. Called at join, before a restart, and when
+ * the group is destroyed. */
+static void spu_host_thread_reap(spu_thread_t* t, int wait)
+{
+    if (!t->host_live) return;
+#ifdef _WIN32
+    (void)wait;
+    if (t->host_thread) CloseHandle(t->host_thread);
+    t->host_thread = NULL;
+#else
+    if (wait) {
+        pthread_join(t->host_thread, NULL);
+        pthread_mutex_destroy(&t->finish_event.mu);
+        pthread_cond_destroy(&t->finish_event.cv);
+    } else {
+        pthread_detach(t->host_thread);
+    }
+#endif
+    t->host_live = 0;
+}
+
 /* Host-thread entry for a thread running its image's own lifted SPU code.
  *
  * Everything SPU here is in runtime/spu/spu_lifted_thread.c; this is the part
@@ -1067,6 +1095,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 d.image_id = spu_thread_image_id(t);
                 for (int a = 0; a < 4; a++) d.args[a] = t->args[a];
                 spu_lifted_thread_setup(t->sctx, &d);
+                spu_host_thread_reap(t, 0);   /* a previous run's, if never joined */
                 t->running = 1;
 #ifdef _WIN32
                 if (!t->finish_event)
@@ -1076,11 +1105,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
                 t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
                                               spu_exec_thread_proc, t,
                                               STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+                t->host_live = t->host_thread != NULL;
 #else
                 pthread_mutex_init(&t->finish_event.mu, NULL);
                 pthread_cond_init(&t->finish_event.cv, NULL);
                 t->finish_event.done = 0;
                 spu_spawn_host_thread(&t->host_thread, spu_exec_thread_proc, t);
+                t->host_live = 1;
 #endif
                 fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
                         "args=0x%08X -> LIFTED SPU execution (image %d, "
@@ -1185,6 +1216,7 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
             instant++;
             continue;
         }
+        spu_host_thread_reap(t, 0);   /* a previous run's, if never joined */
 #ifdef _WIN32
         /* Manual-reset event so multiple group_join callers all see "set" */
         if (!t->finish_event)
@@ -1194,11 +1226,13 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
         t->host_thread = CreateThread(NULL, spu_host_stack_bytes(),
                                       spu_fallback_thread_proc, t,
                                       STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+        t->host_live = t->host_thread != NULL;
 #else
         pthread_mutex_init(&t->finish_event.mu, NULL);
         pthread_cond_init(&t->finish_event.cv, NULL);
         t->finish_event.done = 0;
         spu_spawn_host_thread(&t->host_thread, spu_fallback_thread_proc, t);
+        t->host_live = 1;
 #endif
         /* Start handshake for a persistent worker: do not let group_start
          * return until the worker has published its live context.
@@ -1289,20 +1323,14 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
 #ifdef _WIN32
                 if (t->finish_event)
                     WaitForSingleObject(t->finish_event, INFINITE);
-                if (t->host_thread) {
-                    CloseHandle(t->host_thread);
-                    t->host_thread = NULL;
-                }
 #else
                 pthread_mutex_lock(&t->finish_event.mu);
                 while (!t->finish_event.done)
                     pthread_cond_wait(&t->finish_event.cv, &t->finish_event.mu);
                 pthread_mutex_unlock(&t->finish_event.mu);
-                pthread_join(t->host_thread, NULL);
-                pthread_mutex_destroy(&t->finish_event.mu);
-                pthread_cond_destroy(&t->finish_event.cv);
 #endif
             }
+            spu_host_thread_reap(t, 1);   /* finished before the join or just now */
             if (t->exit_status < worst) worst = t->exit_status;
         }
         /* ALL_THREADS_EXIT is only the DEFAULT. A thread that stopped on
@@ -1331,12 +1359,20 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
                                    0);
     }
 
-    vm_write_be32(cause_ea,  g->cause);
-    vm_write_be32(status_ea, (uint32_t)g->exit_status);
-
     fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue=0x%X)\n",
             id, g->cause, g->exit_status, g->event_queue_id);
     fflush(stderr);
+    /* PORT FIX (racacit): LV2 joins first, then returns CELL_EFAULT if either
+     * output pointer is NULL -- without writing through it. libspurs' handler
+     * thread (spurs_handler_entry) joins its kernel group with (NULL, NULL)
+     * and ASSERTS the result is EFAULT ("unexpected value 0x0" otherwise,
+     * which aborts real-libsre SPURS). RPCS3's HLE handler checks the same. */
+    if (!cause_ea || !status_ea) {
+        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001000Du;   /* CELL_EFAULT */
+        return (int64_t)(int32_t)0x8001000Du;
+    }
+    vm_write_be32(cause_ea,  g->cause);
+    vm_write_be32(status_ea, (uint32_t)g->exit_status);
     ctx->gpr[3] = 0;
     return 0;
 }
@@ -1392,6 +1428,10 @@ static int64_t sys_spu_thread_group_destroy_handler(ppu_context* ctx)
             uint32_t idx = g->thread_indices[i];
             if (idx < MAX_SPU_THREADS) {
                 spu_thread_t* t = &s_spu_threads[idx];
+                spu_host_thread_reap(t, !t->running);
+#ifdef _WIN32
+                if (t->finish_event && !t->running) { CloseHandle(t->finish_event); t->finish_event = NULL; }
+#endif
                 if (t->local_store) {
                     free(t->local_store);
                     t->local_store = NULL;
@@ -2413,8 +2453,11 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002;
         return (int64_t)ctx->gpr[3];
     }
+    { extern int spurs_hle_write_snr(uint32_t, uint32_t, uint32_t);
+      if (spurs_hle_write_snr(tid, num, val)) { ctx->gpr[3] = 0; return 0; } }
     spu_thread_t* t = spu_find_thread(tid);
     if (!t) {
+        { static int n = 0; if (n++ < 12) fprintf(stderr, "[SPU] write_snr tid=0x%X snr%u <- 0x%08X: NO SUCH THREAD\n", tid, num + 1, val); }
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
         return (int64_t)ctx->gpr[3];
     }

@@ -52,7 +52,9 @@ extern "C" {
 #define RSX_TEX_FMT_DXT45           0x88
 #define RSX_TEX_FMT_G8B8            0x8B
 #define RSX_TEX_FMT_DEPTH24_D8      0x90
-#define RSX_TEX_FMT_DEPTH16         0x92
+#define RSX_TEX_FMT_DEPTH24_D8_F    0x91
+#define RSX_TEX_FMT_DEPTH16        0x92
+#define RSX_TEX_FMT_DEPTH16_F      0x93
 #define RSX_TEX_FMT_LINEAR          0x20         /* modifier: no swizzle     */
 #define RSX_TEX_FMT_UNNORM          0x40         /* modifier: texel coords   */
 #define RSX_TEX_FMT_BASE_MASK       0x9F         /* format sans modifiers    */
@@ -83,12 +85,12 @@ extern "C" {
 #define RSX_DSP_CLASS_STATE     1   /* decoded by a getter the pipeline uses */
 #define RSX_DSP_CLASS_EXEC      2   /* triggers an execution callback        */
 
-/* Cap on one INLINE_ARRAY stream. A stream is bounded by a single
- * BEGIN_END pair, and titles use inline arrays for small immediate-mode
- * batches (UI quads, debug geometry); 64 KB is several hundred vertices of
- * a fat format. Overruns are counted, not silently truncated -- half a
- * vertex stream is worse than no draw. */
-#define RSX_DSP_INLINE_MAX_BYTES 65536
+/* Cap on one INLINE_ARRAY stream (one BEGIN_END pair). The buffer grows to
+ * fit; this only bounds a runaway stream. It was a fixed 64 KB, sized for UI
+ * quads and debug geometry -- but A Crack in Time sends its time bomb's
+ * bubble inline, two layers of well over 64 KB each. An overrun is counted
+ * and drops the whole stream: half a vertex stream is worse than no draw. */
+#define RSX_DSP_INLINE_MAX_BYTES (64u << 20)
 
 typedef struct rsx_dispatch rsx_dispatch;
 
@@ -121,7 +123,18 @@ typedef struct rsx_dispatch_sink {
 struct rsx_dispatch {
     u32 regs[RSX_DSP_NUM_REGS];       /* register file: regs[method >> 2]   */
     u32 vp[RSX_DSP_VP_WORDS];         /* transform (vertex) program words   */
+    u32 vp_gen;                       /* bumped on every vp[] write: lets a  */
+                                      /* consumer cache what it derives     */
     u32 constants[RSX_DSP_NUM_CONSTANTS][4]; /* vec4 f32 bit patterns       */
+    /* Slots written since a consumer last took them ([lo, hi), lo == hi =
+     * none): a draw then copies only what changed, not all 8 KB. */
+    u32 const_dirty_lo, const_dirty_hi;
+    /* Per fragment texture unit: bumped when one of its registers takes a
+     * new value (the 8-word block at 0x1A00 + 0x20u, CONTROL3 at 0x1840 + 4u).
+     * A consumer that resolved the unit can tell it is still the same. */
+    u32 tex_gen[RSX_DSP_NUM_TEXTURES];
+    u32 tex_gen_all;                  /* bumped with any tex_gen[]          */
+    u32 vtex_gen;                     /* any vertex-texture register changed */
 
     rsx_dispatch_sink sink;
 
@@ -130,21 +143,19 @@ struct rsx_dispatch {
 
     u32 inline_len;                   /* bytes accumulated this primitive   */
     u32 inline_dropped;               /* streams lost to the cap            */
+    u32 inline_overflow;              /* this primitive's stream went past it */
+    u32 imm_vertices;                 /* immediate-mode vertices this prim  */
+    u32 imm_attr_mask;                /* attributes each one carries        */
 
     /* coverage accounting */
     u32 seen[RSX_DSP_NUM_REGS];       /* per-register write count           */
     u8  klass[RSX_DSP_NUM_REGS];      /* RSX_DSP_CLASS_*                    */
 
-    /* INLINE_ARRAY accumulation, reset at every BEGIN_END(prim). A fixed
-     * buffer rather than a grown allocation because rsx_dispatch_init
-     * memsets the whole struct, which would drop a pointer on the floor.
-     *
-     * LAST on purpose. Sitting it next to current_primitive pushed seen[]
-     * and klass[] 64 KB away from the register file, and those three are
-     * touched together on EVERY method write: The Simpsons Game, which
-     * emits no inline arrays at all, still lost an order of magnitude of
-     * poll rate in the regression gate purely from the added stride. */
-    u8  inline_data[RSX_DSP_INLINE_MAX_BYTES];
+    /* INLINE_ARRAY accumulation, reset at every BEGIN_END(prim): grown on
+     * the heap as a stream needs it (rsx_dispatch_init zeroes the struct,
+     * so a second init of the same dispatcher leaks the old buffer). */
+    u8* inline_data;
+    u32 inline_cap;
 };
 
 /* ---- lifecycle -------------------------------------------------------- */
@@ -159,6 +170,7 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
 
 /* Dispatch one register write. */
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg);
+void rsx_dispatch_const_words(rsx_dispatch* rsx, u32 first, const u8* be, u32 n);
 
 /* ---- decoded state getters -------------------------------------------- */
 

@@ -152,6 +152,35 @@ void spurs_policy_release_instance(uint32_t ea)
     ReleaseSRWLockExclusive(&s_pm_directory_lock);
 }
 
+/* racacit: SPU thread-group local-store window. On hardware every SPU thread
+ * of a group sees its peers' local store at EA 0xF0000000 + n*0x100000 (the
+ * problem-state area follows at +0x40000). A Crack in Time's collision jobs
+ * rely on it: the broad-phase job publishes candidate records in its own LS
+ * (EA 0xF0007700) and the narrow-phase job, on another SPU, DMAs them out.
+ * Map such an EA onto the LS of the sibling PM lane (same workload). */
+uint8_t* spurs_lane_ls_window(spu_context* self, uint32_t ea)
+{
+    uint32_t off = ea - 0xF0000000u, n = off >> 20, lso = off & 0xFFFFFu;
+    if (ea < 0xF0000000u || n >= 6 || lso >= 0x40000u) return NULL;
+    /* Peer lanes of the same SPURS instance and workload (upstream keys the
+     * resident contexts by instance EA, workload and lane). */
+    uint8_t* r = NULL;
+    int found = 0;
+    AcquireSRWLockShared(&s_pm_directory_lock);
+    for (unsigned i = 0; i < SPURS_PM_INSTANCES && !found; i++) {
+        struct PmInstance* pi = &s_pm_instances[i];
+        if (!pi->used) continue;
+        for (uint32_t w = 0; w < 32 && !found; w++)
+            for (uint32_t k = 0; k < 6 && !found; k++)
+                if (pi->slots[w][k].ctx == self) {
+                    found = 1;
+                    if (pi->slots[w][n].ctx) r = pi->slots[w][n].ctx->ls + lso;
+                }
+    }
+    ReleaseSRWLockShared(&s_pm_directory_lock);
+    return r;
+}
+
 int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                           const uint8_t* pm_host, uint32_t pm_size,
                           uint64_t wkl_data, uint32_t wid, uint32_t spurs_ea,
@@ -237,8 +266,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     ctx->policy_mode = 1;
 
     /* PM image at its load base (first entry only -- LS persists). */
-    if (first)
+    if (first) {
         memcpy(ctx->ls + 0xA00, pm_host, pm_size);
+        extern void spu_registry_seal_image(int, const uint8_t*, uint32_t, uint32_t);
+        spu_registry_seal_image(image_id, ctx->ls, 0xA00, 0xA00 + pm_size);
+    }
 
     /* SpursKernelContext at LS 0x100 (fields big-endian, like all guest data). */
     uint8_t* ls = ctx->ls;
@@ -295,6 +327,16 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     ctx->gpr[4]._u32[3] = 0;
     ctx->gpr[5]._u32[0] = 0;                           /* poll status */
 
+    /* racacit: deliver the SNR values the title wrote to this virtual SPU's
+     * thread (see cellSpursGetInfo / spurs_hle_write_snr). */
+    { extern int spurs_hle_get_snr(uint32_t, uint32_t, uint32_t, uint32_t*);
+      for (uint32_t k = 0; k < 2; k++) { uint32_t v;
+          if (ctx->ch_sig_notify[k].count != 0) continue;
+          /* Not written (yet): the titles seen so far write SPU i's SNR1 with
+           * i, so the lane index is the faithful default. */
+          if (!spurs_hle_get_snr(spurs_ea, spu_num, k, &v)) { if (k) continue; v = spu_num; }
+          spu_channel_write(&ctx->ch_sig_notify[k], v); } }
+
     g_spurs_pm_polls  = 0;
     g_spurs_pm_exited = 0;
 
@@ -320,13 +362,11 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * concurrent lanes would interleave the buffer). */
     extern uint32_t g_pm_flow_buf[]; extern volatile unsigned g_pm_flow_n;
     extern void* volatile g_pm_flow_ctx;
-    extern volatile unsigned g_spu_putllc_count;
     extern volatile unsigned g_spu_putllc_sync_hit;
     extern uint32_t g_barrier_sync_watch;
     static SPU_THREAD_LOCAL int s_flow = -1;
     if (s_flow < 0) s_flow = getenv("SPURS_PM_FLOW") ? 1 : 0;
     unsigned putllc_before = g_spu_putllc_sync_hit;
-    (void)g_spu_putllc_count;
     /* Trace ONLY the stalled queue's own runs: wkl_data == the sync EA the PPU
      * barrier/ticket probes armed (ticket-pub arms it at first publish, before
      * the PM's first work pass). Idle re-runs of this wid matter as much as the

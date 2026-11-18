@@ -3615,7 +3615,7 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
                   | ((u64)d->wrap_r << 12)
                   | ((u64)(u32)(d->min_lod * 256.0f) << 16)
                   | ((u64)(u32)(d->max_lod * 256.0f) << 32)
-                  | ((u64)(d->border & 3u) << 56);
+                  | ((u64)(d->border_class & 3u) << 56);
     for (u32 i = 0; i < s_eng_samp_count; i++)
         if (s_eng_samp[i].key == key) return (int)i;
     if (s_eng_samp_count >= ENG_MAX_SAMPLERS) return -1;
@@ -3636,13 +3636,13 @@ static int eng_sampler_slot(const rsx_be_sampler_desc* d)
      * rsx_be_sampler_desc.border): a depth map's 1.0 border is opaque white,
      * and a colour Metal has no constant for clamps to the edge texel, which
      * is nearer to it than black. */
-    if (d->border == 3) {
+    if (d->border_class == 3) {
         if (sd.sAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.sAddressMode = MTLSamplerAddressModeClampToEdge;
         if (sd.tAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
         if (sd.rAddressMode == MTLSamplerAddressModeClampToBorderColor) sd.rAddressMode = MTLSamplerAddressModeClampToEdge;
     }
-    sd.borderColor  = d->border == 2 ? MTLSamplerBorderColorOpaqueWhite
-                    : d->border == 1 ? MTLSamplerBorderColorOpaqueBlack
+    sd.borderColor  = d->border_class == 2 ? MTLSamplerBorderColorOpaqueWhite
+                    : d->border_class == 1 ? MTLSamplerBorderColorOpaqueBlack
                                      : MTLSamplerBorderColorTransparentBlack;
     if (d->min_linear && d->mip_present && eng_aniso() > 1)
         sd.maxAnisotropy = (NSUInteger)eng_aniso();
@@ -3730,6 +3730,20 @@ static void eng_set_depth_bias(void* user, float slope, float units, u32 depth_b
     (void)user;
     s_eng_pending.depth_slope = slope;
     s_eng_pending.depth_bias  = depth_bits == 16u ? units * 256.0f : units;
+}
+
+/* racacit: the engine contract this tree keeps (rsx_draw_engine.h) passes
+ * set_depth_bias(units, factor) with no depth-buffer width, and a colour
+ * snapshot request with the region size; adapt them to this backend's own. */
+static void eng_set_depth_bias_uf(void* user, float units, float factor)
+{
+    eng_set_depth_bias(user, factor, units, 24u);
+}
+
+static u32 eng_color_snapshot_wh(void* user, u32 surface, u32 w, u32 h)
+{
+    (void)w; (void)h;   /* the copy covers the whole target */
+    return eng_color_snapshot(user, surface);
 }
 
 static void eng_draw(void* user, rsx_topology topology, const void* vertices,
@@ -4622,17 +4636,18 @@ static void eng_present(void* user, u32 surface)
     eng_dump_frame(src);
 }
 
-static void eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
-                         void* out, u32 out_pitch)
+static int eng_readback(void* user, u32 surface, u32 x, u32 y, u32 w, u32 h,
+                        void* out, u32 out_pitch)
 {
     (void)user;
     id<MTLTexture> t = eng_obj(surface);
-    if (!t || !out || !out_pitch || !w || !h) return;
-    if (x + w > [t width] || y + h > [t height]) return;
+    if (!t || !out || !out_pitch || !w || !h) return -1;
+    if (x + w > [t width] || y + h > [t height]) return -1;
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     [t getBytes:out bytesPerRow:out_pitch
      fromRegion:MTLRegionMake2D(x, y, w, h) mipmapLevel:0];
     if (ft_t0) ps3_ft_span(PS3_FT_READBACK, 0, w, h, ft_t0, ps3_ft_now());
+    return 0;
 }
 
 /* Read depth through the existing full-size R32Float resolve, then copy the
@@ -4709,7 +4724,7 @@ static const rsx_draw_backend s_engine_backend = {
     .depth_target_release = eng_obj_release,
     .depth_snapshot       = eng_depth_snapshot,
     .depth_readback       = eng_depth_readback,
-    .color_snapshot       = eng_color_snapshot,
+    .color_snapshot       = eng_color_snapshot_wh,
     .depth_as_color       = eng_depth_as_color,
     .pipeline_create      = eng_pipeline_create,
     .pipeline_release     = eng_pipeline_release,
@@ -4722,7 +4737,7 @@ static const rsx_draw_backend s_engine_backend = {
     .set_viewport         = eng_set_viewport,
     .set_scissor          = eng_set_scissor,
     .set_stencil_ref      = eng_set_stencil_ref,
-    .set_depth_bias       = eng_set_depth_bias,
+    .set_depth_bias       = eng_set_depth_bias_uf,
     .draw                 = eng_draw,
     .clear_color          = eng_clear_color,
     .clear_depth_stencil  = eng_clear_depth_stencil,

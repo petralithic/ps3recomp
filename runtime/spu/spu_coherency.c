@@ -32,43 +32,62 @@ extern "C" {
  * exclusion semantics, now shared. MSVC uses a bounded polite spin loop;
  * POSIX spins briefly and then parks on a mutex (see below).
  * ===========================================================================*/
-#if defined(_MSC_VER)
-#include <intrin.h>
-#include <windows.h>   /* SwitchToThread */
+#if defined(_WIN32)
+#include <windows.h>   /* SwitchToThread, WaitOnAddress */
 static volatile long g_lockline = 0;
+static volatile long g_lockline_waiters = 0;
+typedef BOOL (WINAPI* woa_fn)(volatile VOID*, PVOID, SIZE_T, DWORD);
+typedef VOID (WINAPI* wba_fn)(PVOID);
+static woa_fn s_woa; static wba_fn s_wba; static volatile int s_ll_init;
+static int s_ll_spin = 4096;
 /* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
- * pause, and yield after a long wait. The bare exchange loop let GH3's four
- * idle job-policy pollers saturate the line and delay every other SPU atomic
- * -- FMOD's mixer task among them, 25-40 ms at a time. */
-/* After ~1 ms of spinning (six rounds of 4096 pauses) the waiter sleeps instead.
- * SwitchToThread only hands the core to a thread queued on this same processor,
- * and Sleep(0) only to one of equal or higher priority -- neither reaches a
- * lower-priority holder that is waiting for a core. With every core busy, waiters
- * above the holder's priority could keep it off the CPU for tens of milliseconds.
- * A normal wait is far under a microsecond and never gets here.
- * SPU_LOCKLINE_SLEEP=0 keeps the plain spin. */
+ * pause, yield after a while, and then really wait. The bare exchange loop let
+ * GH3's four idle job-policy pollers saturate the line and delay every other SPU
+ * atomic -- FMOD's mixer task among them, 25-40 ms at a time.
+ *
+ * This was under _MSC_VER until v99, and the Windows build is zig's clang: it got
+ * the bare exchange loop after all. With more threads than CPUs a holder that loses
+ * its CPU kept all the others hammering the line until it got one back (Windows'
+ * time slice: 15+ ms): 48 fps on 6 threads and 1-5 on 4, game audio at 6-14 blocks a
+ * second of its 187.5, with every CPU flat out. Waiting frees the CPU the holder needs. */
 void spu_lockline_lock(void)
 {
-    static int s_sleep = -1;
+    if (!_InterlockedExchange(&g_lockline, 1)) return;
+    if (!s_ll_init) {
+        extern int racacit_few_cpus(void);
+        HMODULE m = LoadLibraryA("api-ms-win-core-synch-l1-2-0.dll");
+        if (m) { s_woa = (woa_fn)(void*)GetProcAddress(m, "WaitOnAddress"); s_wba = (wba_fn)(void*)GetProcAddress(m, "WakeByAddressSingle"); }
+        if (racacit_few_cpus()) s_ll_spin = 128;
+        s_ll_init = 1;
+    }
     unsigned spins = 0, rounds = 0;
-    while (_InterlockedExchange(&g_lockline, 1)) {
-        if (s_sleep < 0) { const char* e = getenv("SPU_LOCKLINE_SLEEP"); s_sleep = !(e && e[0] == '0'); }
-        do {
-            _mm_pause();
-            if (++spins >= 4096) {
-                spins = 0;
-                if (rounds++ < 6 || !s_sleep) SwitchToThread(); else Sleep(1);
-            }
-        } while (g_lockline);
+    do {
+        while (g_lockline) {
+            YieldProcessor();
+            if (++spins < (unsigned)s_ll_spin) continue;
+            spins = 0;
+            if (++rounds < 3 || !s_woa) { SwitchToThread(); continue; }
+            long held = 1;
+            _InterlockedIncrement(&g_lockline_waiters);
+            if (g_lockline) s_woa(&g_lockline, &held, sizeof held, 1);
+            _InterlockedDecrement(&g_lockline_waiters);
+        }
+    } while (_InterlockedExchange(&g_lockline, 1));
+}
+void spu_lockline_unlock(void)
+{
+    _InterlockedExchange(&g_lockline, 0);
+    if (g_lockline_waiters && s_wba) s_wba((PVOID)&g_lockline);
+}
+/* The short locks' wait: on a plain read, with a pause; a holder off its CPU gets a yield. */
+void spu_spin_wait(volatile long* lock)
+{
+    unsigned spins = 0;
+    while (*lock) {
+        YieldProcessor();
+        if (++spins >= 1024u) { spins = 0; SwitchToThread(); }
     }
 }
-void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
-#elif defined(_WIN32)
-/* Non-MSVC Windows keeps the plain spin, without a pthread dependency. */
-#include <stdatomic.h>
-static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
-void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
-void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
 #else
 #include <pthread.h>
 #include <time.h>
@@ -132,14 +151,18 @@ void spu_lockline_unlock(void) { if (pthread_mutex_unlock(&g_lockline)) abort();
 #define SPU_COH_LINES       (1u << (32 - SPU_COH_LINE_SHIFT))   /* 2^25 lines */
 #define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
 
-static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+unsigned char spu_coh_bitmap_g[SPU_COH_BITMAP_SZ];   /* read inline by spu_coh_is_reserved (header) */
+#define s_coh_bitmap spu_coh_bitmap_g
 
 /* g_spu_coh_bits (spu_coh_bitmap.h) stays NULL until the first GETLLAR
  * anywhere. That keeps the PPU fast path off the bitmap entirely for a title
  * that runs no SPU code, and keeps every existing test that stores through
  * vm_write* paying one compare against a hot global. Written under the lock;
  * read unlocked, where a stale NULL costs at most one missed event on the very
- * first reservation of the run. */
+ * first reservation of the run. racacit: spu_coh_armed_g mirrors it for the
+ * RACiT inline readers (spu_coh_is_reserved_fast, ppu_loader.cpp). */
+volatile int spu_coh_armed_g;
+#define s_coh_armed spu_coh_armed_g
 
 /* Every live virtual context may retain a reservation between scheduling
  * quanta; physical SPU count is not a bound on this set. All access is under
@@ -160,6 +183,14 @@ static spu_coh_watch* s_coh_watches;
 
 unsigned long g_spu_lr_raise = 0;
 
+/* For the [mem] log line (game/main.cpp): lines marked in the bitmap now, and
+ * writes spu_coh_notify_write was told of. A line stays marked once any SPU
+ * reserved it, and every PPU store into a marked line takes the locked path:
+ * if this count keeps climbing through a long session, so does that cost. */
+unsigned long g_spu_coh_lines = 0;
+unsigned long g_spu_coh_writes = 0;
+unsigned long g_ppu_coh_stores = 0;   /* of those, PPU stores (ppu_loader.cpp; the rest are SPU atomics) */
+
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     /* Read before writing. The kernel reserves the same few lines over and
@@ -168,10 +199,14 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
      * the bitmap byte. */
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
     const unsigned char bit = (unsigned char)(1u << (line & 7));
-    if (!(s_coh_bitmap[line >> 3] & bit))
+    if (!(s_coh_bitmap[line >> 3] & bit)) {
         s_coh_bitmap[line >> 3] |= bit;
+        g_spu_coh_lines++;
+    }
     if (!g_spu_coh_bits)
         g_spu_coh_bits = s_coh_bitmap;
+    if (!s_coh_armed)
+        s_coh_armed = 1;
 
     if (!ctx) return;
     for (unsigned i = 0; i < s_coh_n; i++)
@@ -272,10 +307,24 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
     spu_lockline_unlock();
 }
 
-int spu_coh_is_reserved(uint32_t addr)
+/* racacit: hand a line a title marked with spu_coh_reserve(NULL, ...) back to
+ * the PPU's lock-free store path (game/stubs.cpp, the collision records) --
+ * unless an SPU holds a reservation on it right now; its next GETLLAR marks it
+ * again anyway. Lock-line lock held. */
+void spu_coh_unreserve_line(uint32_t ea)
 {
-    return spu_coh_line_reserved(addr);
+    uint32_t line = ea & ~127u;
+    for (unsigned i = 0; i < s_coh_n; i++) {
+        spu_context* c = s_coh_ctxs[i];
+        if (c && c->resv_valid && (c->resv_ea & ~127u) == line) return;
+    }
+    line >>= SPU_COH_LINE_SHIFT;
+    if (s_coh_bitmap[line >> 3] & (1u << (line & 7))) g_spu_coh_lines--;
+    s_coh_bitmap[line >> 3] &= (unsigned char)~(1u << (line & 7));
 }
+
+/* Hot paths use the inline spu_coh_is_reserved_fast (spu_coherency.h). */
+int spu_coh_is_reserved(uint32_t addr) { return spu_coh_is_reserved_fast(addr); }
 
 /* A DMA PUT is issued BY an SPU, and hardware does not take that SPU's own
  * reservation away for its own MFC write -- the MFC is part of the same SPE.
@@ -385,8 +434,24 @@ void spu_coh_notify_write_except(uint32_t ea, const void* self)
     }
 }
 
+/* racacit: title hooks on SPU DMA of one guest structure (game/stubs.cpp, the
+ * A Crack in Time collision command record). NULL for every other title.
+ *   g_coh_write_hook     -- every write spu_coh_notify_write is told of: a PPU
+ *                           store / stwcx. / vector store, or an SPU atomic, into
+ *                           a reserved line (DMA PUTs use the _except variant
+ *                           and are not reported). Lock-line lock held.
+ *   g_spu_get_copy_hook  -- a DMA GET; returns 1 if it made the copy itself.
+ *   g_spu_put_skip_hook  -- a DMA PUT into a reserved line, lock held; returns 1
+ *                           to drop the copy (the transfer still completes). */
+void (*g_coh_write_hook)(uint32_t ea) = 0;
+int  (*g_spu_get_copy_hook)(void* spu, const uint8_t* ls, uint32_t lsa, uint32_t ea, uint32_t size,
+                            uint8_t* dst, const uint8_t* src) = 0;
+int  (*g_spu_put_skip_hook)(void* spu, const uint8_t* ls, uint32_t lsa, uint32_t ea, uint32_t size) = 0;
+
 void spu_coh_notify_write(uint32_t ea)
 {
+    g_spu_coh_writes++;
+    if (g_coh_write_hook) g_coh_write_hook(ea);
     uint32_t line = ea & ~127u;
     ppu_resv_break_line(ea);
     spu_coh_writer_fence();
@@ -415,6 +480,39 @@ void spu_coh_notify_write(uint32_t ea)
             spu_ch_wake(c);
         }
     }
+}
+
+/* racacit: wake every parked SPU now. A Crack in Time posts its SPU jobs
+ * with plain stores (no lock-line notify reaches the idle SPURS kernels),
+ * then the main thread waits on them -- about nine submit/wait round trips
+ * per view per frame (func_004DFDF0). An idle lane only noticed the new work
+ * when its spu_lr_wait bound ran out (SPU_LR_WAIT_US), so every round trip
+ * paid that bound. Called at the entry of the game's job/batch waits
+ * (patch_lift step "spu kick"): each parked lane gets a reservation-lost
+ * event, re-reads its workload state at once and finds the job. A spurious
+ * LR event is harmless -- the kernel re-polls and parks again.
+ * MEASURED 2026-10-18 (Galacton, standing still, 2x2 runs, order swapped):
+ * no effect -- frame-waits stayed ~135 ms/s and frame times moved only with
+ * run order. The waits are the jobs' own run time (igMobyPreRender ~1.4 ms a
+ * frame), not lane pickup. So it is OFF by default; SPU_KICK_ON_WAIT=1 turns
+ * it on. */
+unsigned long g_spu_kicks = 0;
+void racacit_spu_kick(void)
+{
+    static int s_on = -1;
+    if (s_on < 0) { const char* e = getenv("SPU_KICK_ON_WAIT"); s_on = e ? atoi(e) != 0 : 0; }
+    if (!s_on) return;
+    spu_lockline_lock();
+    for (unsigned i = 0; i < s_coh_n; i++) {
+        spu_context* c = s_coh_ctxs[i];
+        if (!c || !c->resv_valid) continue;
+        SPU_EVENT_SET(c, SPU_EVENT_LR);
+        __atomic_store_n(&c->resv_valid, 0, __ATOMIC_RELAXED);
+        g_spu_lr_raise++;
+        spu_ch_wake(c);
+    }
+    spu_lockline_unlock();
+    g_spu_kicks++;
 }
 
 #ifdef __cplusplus

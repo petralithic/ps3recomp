@@ -2,6 +2,7 @@
  * ps3recomp - Memory management syscalls (implementation)
  */
 
+#include <stdlib.h>
 #include "sys_memory.h"
 #include <stdio.h>
 #include <string.h>
@@ -138,7 +139,13 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
     if (ct) ct->used_size += size;
     if (addr + size > g_sys_mem_bump_ptr) g_sys_mem_bump_ptr = addr + size;
     bump_unlock();
-    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X, cid=%u) -> 0x%08X\n", size, flags, cid, addr);
+    {   /* PORT PATCH (racacit): a game that retries allocations logs this at a
+         * very high rate; log only when SYS_MEMORY_TRACE is set. */
+        static int trace = -1;
+        if (trace < 0) trace = getenv("SYS_MEMORY_TRACE") != NULL;
+        if (trace)
+            fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X, cid=%u) -> 0x%08X\n", size, flags, cid, addr);
+    }
     if (addr_out) write_be32(addr_out, addr);
     return CELL_OK;
 }
@@ -176,6 +183,8 @@ int64_t sys_memory_allocate_from_container(ppu_context* ctx)
 int64_t sys_memory_free(ppu_context* ctx)
 {
     uint32_t addr = LV2_ARG_U32(ctx, 0);
+    { static int _n; if ((_n < 5 && (_n++, 1))) fprintf(stderr, "[sys_memory] free(0x%08X) lr=0x%08X\n", addr, (unsigned)ctx->lr); }
+
     bump_lock();
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
