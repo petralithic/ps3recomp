@@ -67,8 +67,38 @@ u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes)
 
 /* ---- output appender --------------------------------------------------- */
 typedef struct { char* p; u32 cap; u32 len; int overflow; } Out;
+/* Apple: no `precise` (SPIR-V NoContraction) in the vertex programs.
+ * SPIRV-Cross, inside MoltenVK, implements it by calling an optnone helper
+ * (spvFAdd/spvFSub/spvFMul) for every add, subtract and multiply, a median
+ * of 260 calls per vertex program here, and those calls were most of the
+ * GPU's frame (Zolar Forest: fence waits ~1.2 s per 120 frames -> ~0.1 s).
+ * The exact dots (vp_dot3/vp_dot4) stay exact without it on Apple GPUs: the
+ * product error is an explicit fma (mad), and Metal's compiler neither fused
+ * p + a*b nor reordered the TwoSum terms in any math mode (checked: 1M
+ * cases where fusing would change the sum, fast, relaxed and safe modes).
+ * RSX_VP_PRECISE=1 keeps `precise`. */
+static int vp_keep_precise(void)
+{
+#if defined(__APPLE__)
+    static int k = -1;
+    if (k < 0) { const char* e = getenv("RSX_VP_PRECISE"); k = e && *e == '1'; }
+    return k;
+#else
+    return 1;
+#endif
+}
+
 static void emit(Out* o, const char* s)
 {
+    if (!vp_keep_precise() && strstr(s, "precise ")) {
+        for (const char* q = s; *q; ) {
+            if (!strncmp(q, "precise ", 8)) { q += 8; continue; }
+            if (o->len + 2 > o->cap) { o->overflow = 1; return; }
+            o->p[o->len++] = *q++;
+        }
+        o->p[o->len] = '\0';
+        return;
+    }
     u32 n = (u32)strlen(s);
     if (o->len + n + 1 > o->cap) { o->overflow = 1; return; }
     memcpy(o->p + o->len, s, n); o->len += n; o->p[o->len] = '\0';
@@ -358,6 +388,61 @@ static int rsx_vp_decompile_impl(
         }
         leader[0] = 1;
     }
+    /* Which DP3/DPH/DP4 need the exact (Dot2) form. The exactness is there
+     * for the position: depth z-fought where world coordinates are large (see
+     * vp_dot4). A dot that never reaches o[0] -- lighting, texture
+     * coordinates, colours -- gets the plain sum of the same products (0*x
+     * rule kept), about a tenth of the work. A backward slice from the writes
+     * to o[0] over the temps; programs with flow control or condition codes
+     * keep the exact form everywhere. RSX_VP_EXACT_DOTS=1 restores it for
+     * all programs. */
+    static u8 exact_dot[RSX_VP_MAX_INSTR + 1];
+    memset(exact_dot, 1, sizeof exact_dot);
+    {
+        static int all_exact = -1;
+        if (all_exact < 0) { const char* e = getenv("RSX_VP_EXACT_DOTS"); all_exact = e && *e == '1'; }
+        u32 rd[RSX_VP_MAX_INSTR][2], vt[RSX_VP_MAX_INSTR], st[RSX_VP_MAX_INSTR];
+        u8 vpos[RSX_VP_MAX_INSTR], spos[RSX_VP_MAX_INSTR], vfull[RSX_VP_MAX_INSTR], sfull[RSX_VP_MAX_INSTR];
+        int n = 0, simple = !has_flow && !all_exact, sees_pos = 0;
+        u32 o2 = 0;
+        while (simple && o2 + 16 <= max_bytes && n < RSX_VP_MAX_INSTR) {
+            const u32 e0 = rd_le(ucode + o2), e1 = rd_le(ucode + o2 + 4);
+            const u32 e2 = rd_le(ucode + o2 + 8), e3 = rd_le(ucode + o2 + 12);
+            o2 += 16;
+            if (((e0 >> 13) & 1) || ((e0 >> 14) & 1)) { simple = 0; break; }   /* CC test / update */
+            const u32 vop = (e1 >> 22) & 0x1F, sop = (e1 >> 27) & 0x1F;
+            const int vm = (e3 >> 13) & 0xF, sm = (e3 >> 17) & 0xF;
+            const u32 sr0 = ((e2 >> 23) & 0x1FF) | ((e1 & 0xFF) << 9), sr1 = (e2 >> 6) & 0x1FFFF;
+            const u32 sr2 = ((e3 >> 21) & 0x7FF) | ((e2 & 0x3F) << 11);
+            const u32 dout = (e3 >> 2) & 0x1F, dtmp = (e0 >> 15) & 0x3F, stmp = (e3 >> 7) & 0x3F;
+            const int vres = (e0 >> 30) & 1;
+            #define TMPBIT(sr) ((((sr) & 3u) <= 1u) ? (1u << (((sr) >> 2) & 31u)) : 0u)
+            const int von = vm && vop != 0, son = sm && sop != 0;
+            rd[n][0] = von ? (TMPBIT(sr0) | TMPBIT(sr1) | TMPBIT(sr2)) : 0u;
+            rd[n][1] = son ? TMPBIT(sr2) : 0u;
+            #undef TMPBIT
+            vt[n] = (von && dtmp != 0x3F) ? (dtmp & 31u) : 32u;
+            st[n] = (son && stmp != 0x3F) ? (stmp & 31u) : 32u;
+            vpos[n] = von && vres && dout != 0x1F && (dout & 15u) == 0;
+            spos[n] = son && !vres && dout != 0x1F && (dout & 15u) == 0;
+            vfull[n] = vm == 0xF; sfull[n] = sm == 0xF;
+            sees_pos |= vpos[n] | spos[n];
+            n++;
+            if (e3 & 1u) break;
+        }
+        if (simple && sees_pos) {
+            u32 need = 0;
+            for (int i = n - 1; i >= 0; i--) {
+                const int vneed = vpos[i] || (vt[i] < 32u && ((need >> vt[i]) & 1u));
+                const int sneed = spos[i] || (st[i] < 32u && ((need >> st[i]) & 1u));
+                exact_dot[i] = (u8)vneed;
+                if (vt[i] < 32u && vfull[i]) need &= ~(1u << vt[i]);
+                if (st[i] < 32u && sfull[i] && st[i] != vt[i]) need &= ~(1u << st[i]);
+                if (vneed) need |= rd[i][0];
+                if (sneed) need |= rd[i][1];
+            }
+        }
+    }
     int block_open = 0;
 
     u32 off = 0; int instrs = 0;
@@ -428,9 +513,9 @@ static int rsx_vp_decompile_impl(
             case 0x02: snprintf(rhs,sizeof rhs,"vp_mul((%s),(%s))",A,B); break;  /* MUL */
             case 0x03: snprintf(rhs,sizeof rhs,"(%s)+(%s)",A,C); break;        /* ADD: src0 + src2 */
             case 0x04: snprintf(rhs,sizeof rhs,"vp_mul((%s),(%s))+(%s)",A,B,C); break; /* MAD */
-            case 0x05: snprintf(rhs,sizeof rhs,"vp_dot3((%s),(%s))",A,B); break; /* DP3 */
-            case 0x06: snprintf(rhs,sizeof rhs,"vp_dot4(float4((%s).xyz,1.0),(%s))",A,B); break; /* DPH: dot3 + b.w */
-            case 0x07: snprintf(rhs,sizeof rhs,"vp_dot4((%s),(%s))",A,B); break; /* DP4 */
+            case 0x05: snprintf(rhs,sizeof rhs,"%s((%s),(%s))",exact_dot[instrs-1]?"vp_dot3":"vp_dot3f",A,B); break; /* DP3 */
+            case 0x06: snprintf(rhs,sizeof rhs,"%s(float4((%s).xyz,1.0),(%s))",exact_dot[instrs-1]?"vp_dot4":"vp_dot4f",A,B); break; /* DPH: dot3 + b.w */
+            case 0x07: snprintf(rhs,sizeof rhs,"%s((%s),(%s))",exact_dot[instrs-1]?"vp_dot4":"vp_dot4f",A,B); break; /* DP4 */
             case 0x08: snprintf(rhs,sizeof rhs,"float4(1,(%s).y*(%s).y,(%s).z,(%s).w)",A,B,A,B); break; /* DST */
             case 0x09: snprintf(rhs,sizeof rhs,"min((%s),(%s))",A,B); break;   /* MIN */
             case 0x0A: snprintf(rhs,sizeof rhs,"max((%s),(%s))",A,B); break;   /* MAX */
@@ -656,17 +741,31 @@ static int rsx_vp_decompile_impl(
          * Dekker's product from Veltkamp halves. Only multiplies and adds,
          * which Vulkan requires correctly rounded -- an FMA (mad) need not be
          * fused there, and an unfused one would make the error term wrong. */
+#ifdef __APPLE__
+        /* HLSL mad becomes SPIR-V Fma and then Metal fma(), which is fused
+         * with a single rounding on every Apple GPU,
+         * so the exact product error is one instruction there instead of the
+         * Veltkamp split below. Same result; the split cost about a third of
+         * the frame in vertex-heavy scenes through MoltenVK. */
+        "float vp_mul_err(float a, float b, float p) {\n"
+        "    precise float e = mad(a, b, -p);\n"
+        "    return (a == 0.0 || b == 0.0) ? 0.0 : e; }\n"
+#else
         "float vp_mul_err(float a, float b, float p) {\n"
         "    precise float ca = 4097.0 * a; precise float ah = ca - (ca - a); precise float al = a - ah;\n"
         "    precise float cb = 4097.0 * b; precise float bh = cb - (cb - b); precise float bl = b - bh;\n"
         "    precise float e = ((ah * bh - p) + ah * bl + al * bh) + al * bl;\n"
         "    return (a == 0.0 || b == 0.0) ? 0.0 : e; }\n"
+#endif
         /* (p, s) += a*b: p the running rounded sum, s the running error */
         "void vp_dot_step(inout float p, inout float s, float a, float b) {\n"
         "    precise float h = vp_mul1(a, b); precise float r = vp_mul_err(a, b, h);\n"
         "    precise float t = p + h; precise float z = t - p;\n"
         "    precise float q = (p - (t - z)) + (h - z);\n"
         "    p = t; precise float s2 = s + (q + r); s = s2; }\n"
+        /* The plain forms, for dots that never reach the position. */
+        "float vp_dot3f(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z; }\n"
+        "float vp_dot4f(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z + m.w; }\n"
         "float vp_dot3(float4 a, float4 b) {\n"
         "    precise float p = vp_mul1(a.x, b.x); precise float s = vp_mul_err(a.x, b.x, p);\n"
         "    vp_dot_step(p, s, a.y, b.y); vp_dot_step(p, s, a.z, b.z);\n"

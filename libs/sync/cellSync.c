@@ -23,7 +23,8 @@
 #define SYNC_YIELD() SwitchToThread()
 #else
 #include <sched.h>
-#define SYNC_YIELD() sched_yield()
+void racacit_yield(void);
+#define SYNC_YIELD() racacit_yield()
 #endif
 
 /* CellSyncMutex is 4 bytes and must be 4-byte aligned: every entry point

@@ -1746,6 +1746,174 @@ extern "C" void ppu_vst_coh(uint32_t ea, const void* src, uint32_t n)
     racacit_ring_note('V', g_active_ctx ? (uint32_t)g_active_ctx->thread_id : 0u, g_active_ctx ? (uint32_t)g_active_ctx->lr : 0u, ea, 0);
     if (g_resv_store_active > 0) ppu_resv_break_store(ea);
 }
+#if defined(PPU_FASTMEM) && defined(__APPLE__) && defined(__aarch64__)
+/* PPU_FASTMEM (ppu_recomp.h): the lifted code's guest loads and stores make no
+ * range test. They go through a second view of the guest arena -- the same
+ * pages, mapped again with mach_vm_remap -- in which everything that is not
+ * ordinary memory is PROT_NONE: the null page [0, lo), [lo + span, 4 GB), and
+ * a guard after it. An access there faults; this handler decodes the faulting
+ * load/store, performs it with vm_read* / vm_write* (exactly what the inline
+ * test's slow path called), writes the loaded value into the destination
+ * register as the raw (unswapped) bytes the instruction would have loaded, and
+ * resumes after it. Stores into SPU-reserved lines are still tested inline
+ * (spu_coh_bitmap_g), so the coherent store path never needs a fault. With
+ * diagnostics on (span 0) the whole view is PROT_NONE and every lifted access
+ * takes the runtime path, as before. Only the lifted translation units ever
+ * see the view's address (ppu_inl_cfg.base); the runtime keeps vm_base. */
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <sys/ucontext.h>
+static uint8_t* s_fm_view = 0;
+static struct sigaction s_fm_prev[2];
+static volatile long s_fm_faults = 0;
+extern "C" long ppu_fastmem_faults(void) { return s_fm_faults; }
+static uint64_t fm_xreg(const _STRUCT_ARM_THREAD_STATE64* ss, int r, int sp_ok)
+{
+    if (r == 31) return sp_ok ? ss->__sp : 0;
+    if (r == 29) return ss->__fp;
+    if (r == 30) return ss->__lr;
+    return ss->__x[r];
+}
+static void fm_set_xreg(_STRUCT_ARM_THREAD_STATE64* ss, int r, uint64_t v, int sp_ok)
+{
+    if (r == 31) { if (sp_ok) ss->__sp = v; return; }
+    if (r == 29) { ss->__fp = v; return; }
+    if (r == 30) { ss->__lr = v; return; }
+    ss->__x[r] = v;
+}
+static inline uint64_t fm_ext(uint64_t v, int option, int shift)
+{
+    switch (option) {
+    case 2: v = (uint32_t)v; break;                  /* UXTW */
+    case 3: break;                                   /* LSL / UXTX */
+    case 6: v = (uint64_t)(int64_t)(int32_t)v; break; /* SXTW */
+    case 7: break;                                   /* SXTX */
+    default: return ~0ull;                           /* not a load/store index form */
+    }
+    return v << shift;
+}
+/* Returns 1 when the fault was a lifted guest access and has been emulated. */
+static int fm_emulate(void* uc_, uintptr_t far)
+{
+    ucontext_t* uc = (ucontext_t*)uc_;
+    _STRUCT_ARM_THREAD_STATE64* ss = &uc->uc_mcontext->__ss;
+    const uint32_t in = *(const uint32_t*)ss->__pc;
+    /* load/store register: bits 29:27 = 111, bit 25 = 0 for the single-register forms */
+    if (((in >> 27) & 7) != 7 || ((in >> 25) & 1)) return 0;   /* not a single-register load/store */
+    const int size = (in >> 30) & 3, V = (in >> 26) & 1, opc = (in >> 22) & 3;
+    const int rt = in & 31, rn = (in >> 5) & 31;
+    uint64_t ea; int wb = 0; uint64_t wbv = 0;
+    const uint64_t base = fm_xreg(ss, rn, 1);
+    if (((in >> 24) & 3) == 1) {                      /* unsigned 12-bit immediate, scaled */
+        int scale = size; if (V && opc >= 2) scale = 4;
+        ea = base + ((uint64_t)((in >> 10) & 0xFFF) << scale);
+    } else if ((in >> 21) & 1) {                      /* register offset */
+        if (((in >> 10) & 3) != 2) return 0;
+        int scale = size; if (V && opc >= 2) scale = 4;
+        const int rm = (in >> 16) & 31, option = (in >> 13) & 7, S = (in >> 12) & 1;
+        const uint64_t off = fm_ext(fm_xreg(ss, rm, 0), option, S ? scale : 0);
+        if (off == ~0ull) return 0;
+        ea = base + off;
+    } else {                                          /* 9-bit signed immediate: unscaled / post / pre */
+        const int64_t imm9 = (int64_t)((int32_t)(in << 11) >> 23);
+        const int mode = (in >> 10) & 3;
+        if (mode == 2) return 0;                      /* unprivileged forms */
+        if (mode == 0) ea = base + (uint64_t)imm9;
+        else if (mode == 1) { ea = base; wb = 1; wbv = base + (uint64_t)imm9; }   /* post-index */
+        else { ea = base + (uint64_t)imm9; wb = 1; wbv = ea; }                      /* pre-index */
+    }
+    if (ea - (uintptr_t)s_fm_view >= 0x100000000ull + 0x10000ull) return 0;    /* not a view access */
+    if (far < ea || far - ea >= 16) return 0;         /* the decode must explain the fault */
+    const uint32_t g = (uint32_t)(ea - (uintptr_t)s_fm_view);
+    int n; int load; int sext = 0;
+    if (V) {
+        if (opc >= 2 && size == 0) n = 16; else n = 1 << size;
+        load = opc & 1;
+        if (n == 16) return 0;                        /* q registers: the lifted scalar accessors never use them */
+    } else {
+        n = 1 << size;
+        if (opc == 0) load = 0;
+        else if (opc == 1) load = 1;
+        else { if (size == 3) return 0;               /* prefetch */
+               load = 1; sext = opc == 2 ? 64 : 32; }
+    }
+    if (load) {
+        uint64_t v;                                   /* the guest value, as vm_read* returns it */
+        switch (n) { case 1: v = vm_read8(g); break; case 2: v = vm_read16(g); break;
+                     case 4: v = vm_read32(g); break; default: v = vm_read64(g); break; }
+        uint64_t raw;                                 /* the bytes as the host load would have seen them */
+        switch (n) { case 1: raw = v; break; case 2: raw = __builtin_bswap16((uint16_t)v); break;
+                     case 4: raw = __builtin_bswap32((uint32_t)v); break; default: raw = __builtin_bswap64(v); break; }
+        if (V) {
+            memset(&uc->uc_mcontext->__ns.__v[rt], 0, 16);
+            memcpy(&uc->uc_mcontext->__ns.__v[rt], &raw, (size_t)n);
+        } else {
+            if (sext) {
+                int64_t s = n == 1 ? (int64_t)(int8_t)raw : n == 2 ? (int64_t)(int16_t)raw : (int64_t)(int32_t)raw;
+                raw = sext == 32 ? (uint64_t)(uint32_t)s : (uint64_t)s;
+            }
+            fm_set_xreg(ss, rt, raw, 0);
+        }
+    } else {
+        uint64_t raw = 0;
+        if (V) memcpy(&raw, &uc->uc_mcontext->__ns.__v[rt], (size_t)n);
+        else raw = fm_xreg(ss, rt, 0);
+        switch (n) { case 1: vm_write8(g, (uint8_t)raw); break;
+                     case 2: vm_write16(g, __builtin_bswap16((uint16_t)raw)); break;
+                     case 4: vm_write32(g, __builtin_bswap32((uint32_t)raw)); break;
+                     default: vm_write64(g, __builtin_bswap64(raw)); break; }
+    }
+    if (wb) fm_set_xreg(ss, rn, wbv, 1);
+    ss->__pc += 4;
+    const long nf = __atomic_add_fetch(&s_fm_faults, 1, __ATOMIC_RELAXED);
+    if ((nf & 0x3FFF) == 0 || nf <= 4) fprintf(stderr, "[ppu] fastmem: %ld faults emulated (last guest 0x%08X)\n", nf, g);
+    return 1;
+}
+static void fm_fault(int sig, siginfo_t* si, void* uc)
+{
+    if (s_fm_view && si && fm_emulate(uc, (uintptr_t)si->si_addr)) return;
+    const struct sigaction& prev = s_fm_prev[sig == SIGBUS];
+    if ((prev.sa_flags & SA_SIGINFO) && prev.sa_sigaction) { prev.sa_sigaction(sig, si, uc); return; }
+    if (prev.sa_handler && prev.sa_handler != SIG_DFL && prev.sa_handler != SIG_IGN) { prev.sa_handler(sig); return; }
+    struct sigaction dfl; memset(&dfl, 0, sizeof dfl); dfl.sa_handler = SIG_DFL; sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, NULL);                       /* re-run the access and die as before */
+}
+/* The view, or NULL: the lifted code makes no range test, so the caller must stop. */
+static uint8_t* ppu_fastmem_view(uint32_t lo, uint64_t span)
+{
+    if (!s_fm_view) {
+        const uint64_t sz = 0x100000000ull, guard = 0x10000ull;
+        void* r = mmap(NULL, (size_t)(sz + guard), PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+        if (r == MAP_FAILED) return NULL;
+        mach_vm_address_t v = (mach_vm_address_t)(uintptr_t)r; vm_prot_t cur, max;
+        kern_return_t kr = mach_vm_remap(mach_task_self(), &v, sz, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                                         mach_task_self(), (mach_vm_address_t)(uintptr_t)vm_base, FALSE,
+                                         &cur, &max, VM_INHERIT_NONE);
+        if (kr != KERN_SUCCESS || v != (mach_vm_address_t)(uintptr_t)r) {
+            fprintf(stderr, "[ppu] fastmem: mach_vm_remap failed (%d)\n", kr);
+            munmap(r, (size_t)(sz + guard));
+            return NULL;
+        }
+        struct sigaction sa; memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = fm_fault; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &s_fm_prev[0]);
+        sigaction(SIGBUS, &sa, &s_fm_prev[1]);
+        s_fm_view = (uint8_t*)r;
+    }
+    /* ordinary memory is [lo, lo + span); the rest of the view faults (span 0: all of it) */
+    const uint64_t end = span ? (uint64_t)lo + span : 0;
+    int bad = 0;
+    if (span) {
+        bad |= mprotect(s_fm_view, lo, PROT_NONE);
+        bad |= mprotect(s_fm_view + lo, (size_t)span, PROT_READ | PROT_WRITE);
+        if (end < 0x100000000ull) bad |= mprotect(s_fm_view + end, (size_t)(0x100000000ull - end), PROT_NONE);
+    } else bad |= mprotect(s_fm_view, (size_t)0x100000000ull, PROT_NONE);
+    if (bad) { fprintf(stderr, "[ppu] fastmem: mprotect failed\n"); return NULL; }
+    fprintf(stderr, "[ppu] fastmem: guest view %p, faulting outside 0x%08X-0x%08llX\n", (void*)s_fm_view, lo,
+            (unsigned long long)end);
+    return s_fm_view;
+}
+#endif
 extern "C" void ppu_inl_cfg_refresh(void)
 {
     uint32_t top = (ppu_vm_size && ppu_vm_size < 0xE0000000u) ? ppu_vm_size : 0xE0000000u;   /* SPU_RAW_BASE */
@@ -1755,6 +1923,20 @@ extern "C" void ppu_inl_cfg_refresh(void)
     ppu_inl_cfg.lo   = 0x10000u;
     ppu_inl_cfg.hole = hole;
     ppu_inl_cfg.span = (g_vm_diag || !vm_base) ? 0 : (uint64_t)(top - 0x10000u);
+#if defined(PPU_FASTMEM) && defined(__APPLE__) && defined(__aarch64__)
+    {   /* the lifted code makes no range test: it needs the faulting view, or nothing works */
+        uint8_t* v = vm_base ? ppu_fastmem_view(ppu_inl_cfg.lo, ppu_inl_cfg.span) : NULL;
+        if (!v) { fprintf(stderr, "[ppu] fastmem build without a guest view: refusing to run\n"); abort(); }
+        ppu_inl_cfg.base = v;
+    }
+#endif
+#ifdef PPU_FIXED_VM_BASE
+    if (ppu_inl_cfg.base != (uint8_t*)(uintptr_t)(PPU_FIXED_VM_BASE) || ppu_inl_cfg.span != 0xDFFF0000ull) {
+        fprintf(stderr, "[ppu] fixed-base build, but the guest window is %p +0x%llX: refusing to run\n",
+                (void*)ppu_inl_cfg.base, (unsigned long long)ppu_inl_cfg.span);
+        abort();
+    }
+#endif
     fprintf(stderr, "[ppu] inline guest-memory window 0x%08X-0x%08X%s (GCM page 0x%08X)%c", ppu_inl_cfg.lo,
             (uint32_t)(ppu_inl_cfg.lo + ppu_inl_cfg.span), ppu_inl_cfg.span ? "" : " -- off (diagnostics)", hole, 10);
 }
@@ -3772,7 +3954,23 @@ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
 #define PS3_SC_INFLIGHT_MAX 64
 extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 
+/* Title hook: every lv2 syscall's wall time, with its number and the guest lr
+ * (game/stubs.cpp sets it for RACACIT_MAIN_STATS; NULL otherwise, one test). */
+extern "C" { void (*g_ppu_sc_time_hook)(ppu_context*, uint32_t num, unsigned long long us) = 0; }
+extern "C" void lv2_syscall_body(ppu_context* ctx);
 extern "C" void lv2_syscall(ppu_context* ctx)
+{
+    if (__builtin_expect(g_ppu_sc_time_hook != 0, 0)) {
+        extern unsigned long long ps3_qpc_us(void);
+        const uint32_t num = (uint32_t)ctx->gpr[11];
+        const unsigned long long t0 = ps3_qpc_us();
+        lv2_syscall_body(ctx);
+        g_ppu_sc_time_hook(ctx, num, ps3_qpc_us() - t0);
+        return;
+    }
+    lv2_syscall_body(ctx);
+}
+extern "C" void lv2_syscall_body(ppu_context* ctx)
 {
     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
      * waiting for a store watch to fire. Armed here because lv2_syscall runs

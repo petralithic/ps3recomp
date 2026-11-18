@@ -1146,6 +1146,13 @@ static int eng_surface_retire(u32 slot)
                 s->location, s->offset, s->w, s->h, swz ? " swizzled" : "", age, n_ret, 10);
     if (why) { eng_retired_note(s, span ? span : s->w * s->h * 4u, why); return 0; }
     if (rsx_ww_on() && rsx_ww_guest_written_since(dst, span, s->ww_epoch)) { n_skip++; return 0; }
+    /* Without the write watch (macOS, or RACACIT_NO_WRITE_WATCH) the engine
+     * cannot tell whether the game has reused this memory since the target
+     * was drawn. In main memory the game recycles such ranges for other data
+     * (SPU job code and buffers among it), and writing stale pixels over them
+     * hung Zolar Forest: an SPU job then branched into the pixels. Leave main
+     * memory alone; local (video) memory only ever holds graphics. */
+    if (!rsx_ww_on() && s->location == 1) { n_skip++; return 0; }
     u8* px = (u8*)malloc((size_t)s->w * s->h * 4u);
     if (!px) return -1;
     /* A failed readback writes nothing: the buffer is not pixels. */
@@ -4277,6 +4284,7 @@ typedef struct {
     u64 icontent;           /* the index bytes' part of `content` (0 = unknown) */
     u32 held;               /* bytes it counts against ENG_GEOM_BUDGET */
     u8  indexed;            /* drawn with indices (held by `gpu` once that is set) */
+    u32 checked;            /* no write watch: g.frames + 1 of its last content match */
 } eng_geom_entry;
 static eng_geom_entry* s_geom;          /* ENG_GEOM_SETS * ENG_GEOM_WAYS */
 static u64 s_geom_bytes, s_geom_sweep_frame, s_geom_swept;
@@ -4496,7 +4504,10 @@ static void eng_geom_free(eng_geom_entry* e)
 #define ENG_VB_WAYS     4u
 #define ENG_VB_MAX_SPAN (1u << 18)
 #define ENG_VB_BUDGET   (96ull << 20)
-typedef struct { u64 key; u32 lo, hi, gpu, epoch, frame, bytes; u8* cpu; } eng_vb_entry;
+/* content/checked: with no write watch (macOS), the block's vertex bytes are
+ * hashed when it is built and compared again at most once a frame -- the
+ * rule textures follow -- instead of the watch's "written since". */
+typedef struct { u64 key; u32 lo, hi, gpu, epoch, frame, bytes; u8* cpu; u64 content; u32 checked; } eng_vb_entry;
 static eng_vb_entry* s_vb;
 static int s_vb_on = -1;
 static u32* s_vb_occ; static u32 s_vb_occ_cap;
@@ -4510,7 +4521,7 @@ static int eng_vb_eligible(const rsx_vertex_layout_plan* layout, int rebuild)
 {
     if (s_vb_on < 0) {
         const char* e = getenv("RSX_ENG_VBLOCK");
-        s_vb_on = (e && *e == '2' ? 2 : !(e && *e == '0')) && g.be->draw_cached_vi && g.be->geom_upload && g.be->geom_release && rsx_ww_on();
+        s_vb_on = (e && *e == '2' ? 2 : !(e && *e == '0')) && g.be->draw_cached_vi && g.be->geom_upload && g.be->geom_release;
         if (s_vb_on && e && *e == '2') s_vb_on = 2;
         if (s_vb_on) s_vb = (eng_vb_entry*)calloc(ENG_VB_SETS * ENG_VB_WAYS, sizeof *s_vb);
         if (!s_vb) s_vb_on = 0;
@@ -4680,6 +4691,31 @@ static u32 eng_vb_ranges(const rsx_vertex_layout_plan* layout, u32 a, u32 b,
     return n;
 }
 
+/* The vertex bytes of the n ranges, as one hash (no index bytes: a block
+ * outlives the draws whose indices it served). */
+static u64 eng_vb_content(u32 n, const u8* rloc, const u32* roff, const u32* rlen)
+{
+    u64 h = 0x76626C6B636E74ull;
+    for (u32 i = 0; i < n; i++) {
+        const u8* p = eng_guest_ptr(NULL, rloc[i], roff[i], rlen[i]);
+        if (!p) return 0;
+        h = eng_hash_long(p, rlen[i], h ^ ((u64)rloc[i] << 32 | roff[i]));
+    }
+    return h | 1u;
+}
+
+/* No write watch: is the whole block [lo, hi] still what it was built from?
+ * Hashed at most once a frame. */
+static int eng_vb_unchanged(const rsx_vertex_layout_plan* layout, eng_vb_entry* e)
+{
+    if (e->checked == g.frames + 1u) return 1;
+    u8 rloc[ENG_GEOM_RANGES]; u32 roff[ENG_GEOM_RANGES], rlen[ENG_GEOM_RANGES];
+    const u32 n = eng_vb_ranges(layout, e->lo, e->hi, rloc, roff, rlen, 0, 0);
+    if (!n || eng_vb_content(n, rloc, roff, rlen) != e->content) return 0;
+    e->checked = g.frames + 1u;
+    return 1;
+}
+
 static void eng_vb_drop(eng_vb_entry* e)
 {
     if (e->gpu) g.be->geom_release(g.be->user, e->gpu);
@@ -4724,7 +4760,9 @@ static int eng_vb_get(const rsx_vertex_layout_plan* layout, u32 prim, u32 n_occ,
     eng_vb_entry* e = NULL;
     for (u32 w = 0; w < ENG_VB_WAYS; w++) if (set[w].key == key) { e = &set[w]; break; }
     u8 rloc[ENG_GEOM_RANGES]; u32 roff[ENG_GEOM_RANGES], rlen[ENG_GEOM_RANGES];
-    int hit = e && e->lo <= a && b <= e->hi && eng_vb_ranges(layout, a, b, rloc, roff, rlen, 1, e->epoch);
+    int hit = e && e->lo <= a && b <= e->hi &&
+              (rsx_ww_on() ? eng_vb_ranges(layout, a, b, rloc, roff, rlen, 1, e->epoch) != 0
+                           : eng_vb_unchanged(layout, e));
     if (hit && eng_verify(4) && e->cpu && eng_vb_convert(layout, a, b)) {
         const u32 st = layout->stride, nb = (b - a + 1u) * st;
         if (memcmp(e->cpu + (size_t)(a - e->lo) * st, s_vb_verts, nb) != 0) {
@@ -4746,7 +4784,10 @@ static int eng_vb_get(const rsx_vertex_layout_plan* layout, u32 prim, u32 n_occ,
         }
         if (hi - lo >= ENG_VB_MAX_SPAN) return -1;
         const u32 now = rsx_ww_epoch();
-        if (!eng_vb_ranges(layout, lo, hi, rloc, roff, rlen, 0, 0)) return -1;
+        const u32 nr = eng_vb_ranges(layout, lo, hi, rloc, roff, rlen, 0, 0);
+        if (!nr) return -1;
+        const u64 content = rsx_ww_on() ? 0 : eng_vb_content(nr, rloc, roff, rlen);
+        if (!rsx_ww_on() && !content) return -1;
         if (!eng_vb_convert(layout, lo, hi)) return -1;
         const u32 vbytes = (hi - lo + 1u) * layout->stride;
         u32 cls = 256u; while (cls < vbytes && cls < 0x80000000u) cls <<= 1;   /* what the heap rounds it to */
@@ -4768,6 +4809,7 @@ static int eng_vb_get(const rsx_vertex_layout_plan* layout, u32 prim, u32 n_occ,
         }
         if (e->key) eng_vb_drop(e);
         e->key = key; e->lo = lo; e->hi = hi; e->gpu = gpu; e->epoch = now; e->bytes = cls;
+        e->content = content; e->checked = g.frames + 1u;
         if (eng_verify(4)) { e->cpu = (u8*)malloc(vbytes); if (e->cpu) memcpy(e->cpu, s_vb_verts, vbytes); }
         s_vb_held += cls;
         s_vb_builds++; s_vb_conv_bytes += vbytes;
@@ -4817,7 +4859,20 @@ static int eng_geom_get(const rsx_vertex_layout_plan* layout, u32 prim, int rebu
     if (s_vb_on == 2 && eng_vb_eligible(layout, rebuild)) e = NULL;
     if (e && e->state == 2) {
         int same = eng_geom_unwritten(e);
-        if (same && eng_verify(2) &&
+        /* No write watch (macOS): an entry already matched by content this
+         * frame is not hashed again for its next draws (a shadow pass and
+         * the main pass, say) -- the once-a-frame rule textures and vertex
+         * blocks follow. */
+        if (!same && !rsx_ww_on() && e->checked == g.frames + 1u) {
+            same = 1;
+            /* RSX_ENG_VERIFY=2: still hash it, and say if the game rewrote it within the frame. */
+            if (eng_verify(2) && eng_geom_content(e->n_ranges, e->rloc, e->roff, e->rlen) != e->content) {
+                same = 0;
+                if (eng_verify_say("geomframe"))
+                    fprintf(stderr, "[verify] geometry key %016llX rewritten within frame %u after its check%c",
+                            (unsigned long long)key, g.frames, 10);
+            }
+        } else if (same && eng_verify(2) &&
             eng_geom_content(e->n_ranges, e->rloc, e->roff, e->rlen) != e->content) {
             same = 0;
             if (eng_verify_say("geom"))
@@ -4834,7 +4889,7 @@ static int eng_geom_get(const rsx_vertex_layout_plan* layout, u32 prim, int rebu
                 same = eng_geom_content(e->n_ranges, e->rloc, e->roff, e->rlen) == e->content;
                 if (same) e->icontent = s_geom_last_ih;
             }
-            if (same) e->ww_epoch = ww_now;
+            if (same) { e->ww_epoch = ww_now; e->checked = g.frames + 1u; }
         }
         if (!same) goto geom_miss;
         e->frame = g.frames;
@@ -4946,6 +5001,7 @@ geom_miss:
                 e->held = (u32)need;
                 s_geom_bytes += need;
                 e->state = 2;
+                e->checked = g.frames + 1u;   /* just hashed (content) */
                 /* Once on the GPU side too: every later draw of it copies
                  * nothing, and the CPU copy goes (the upload copies it out --
                  * the backend thread's record or the geometry heap). Kept, it

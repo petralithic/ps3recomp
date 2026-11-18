@@ -709,14 +709,19 @@ static inline void GetSystemTimeAsFileTime(FILETIME* ft)
 }
 static inline void GetSystemTimePreciseAsFileTime(FILETIME* ft) { GetSystemTimeAsFileTime(ft); }
 
+/* racacit_yield (win32_compat.c): the yield Sleep(0), SwitchToThread and the
+ * runtime spin loops use. sched_yield on macOS is swtch_pri, which also
+ * depresses the caller for a scheduler quantum (~10 ms) when the machine is
+ * busy. */
+void racacit_yield(void);
 static inline void Sleep(DWORD ms)
 {
-    if (ms == 0) { sched_yield(); return; }      /* Sleep(0) yields, as on Windows */
+    if (ms == 0) { racacit_yield(); return; }      /* Sleep(0) yields, as on Windows */
     struct timespec d = { (time_t)(ms / 1000u), (long)(ms % 1000u) * 1000000L };
     nanosleep(&d, NULL);
 }
 static inline DWORD SleepEx(DWORD ms, BOOL alertable) { (void)alertable; Sleep(ms); return 0; }
-static inline BOOL  SwitchToThread(void)              { sched_yield(); return TRUE; }
+static inline BOOL  SwitchToThread(void)              { racacit_yield(); return TRUE; }
 static inline UINT  timeBeginPeriod(UINT period)      { (void)period; return TIMERR_NOERROR; }
 static inline UINT  timeEndPeriod(UINT period)        { (void)period; return TIMERR_NOERROR; }
 

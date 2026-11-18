@@ -17,6 +17,9 @@
 #if defined(__SSSE3__)
 #include <tmmintrin.h>
 #endif
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -662,6 +665,25 @@ static SPU_NOINLINE_COLD void spu_ls_read_probe(const spu_context* ctx, uint32_t
     }
 }
 
+/* SPU_LS_IN_CONTEXT=1 (a port's lifted sources, per TU): the 128-bit
+ * local-store accesses address ctx->ls_store instead of through ctx->ls.
+ * Both name the same bytes unless a raw SPU repointed ls at guest memory
+ * (spu_raw.c refuses that in a build that set this). Through the pointer, the
+ * compiler cannot tell a local-store store from a store to the register file
+ * (ls points into the context), so after every stqd it reloaded ctx->ls and
+ * every register the loop carries; at a constant offset from ctx, masked to
+ * the 256 KB array, the two are provably disjoint. */
+#ifndef SPU_LS_IN_CONTEXT
+#define SPU_LS_IN_CONTEXT 0
+#endif
+#if SPU_LS_IN_CONTEXT
+#define SPU_LS_BASE(ctx) ((ctx)->ls_store)
+/* Weak, one per program: tells spu_raw.c that lifted code was built this way. */
+SPU_GATE int g_spu_ls_in_context = 1;
+#else
+#define SPU_LS_BASE(ctx) ((ctx)->ls)
+#endif
+
 /* The read diagnostics, then g_spu_ls_rdiag recomputed: it drops to 0 once
  * none is armed (the first call also settles g_spu_ls_watch_n). */
 static SPU_NOINLINE_COLD void spu_ls_read_diag(const spu_context* ctx, uint32_t lsa)
@@ -681,7 +703,7 @@ static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
         spu_ls_read_diag(ctx, lsa);
 #endif
     lsa &= SPU_LS_MASK & ~0xFu;
-    const uint8_t* p = &ctx->ls[lsa];
+    const uint8_t* p = &SPU_LS_BASE(ctx)[lsa];
 #if defined(__ARM_NEON)
     vst1q_u8(v._u8, vrev32q_u8(vld1q_u8(p)));     /* ldr q; rev32 */
 #elif SPU_LS_VEC
@@ -780,7 +802,7 @@ static SPU_NOINLINE_COLD void spu_ls_write_diag(spu_context* ctx, uint32_t lsa, 
 static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
-    uint8_t* p = &ctx->ls[lsa];
+    uint8_t* p = &SPU_LS_BASE(ctx)[lsa];
     /* racacit: SPU_LS_FILL_GUARD=1 builds name the lifted function storing
      * the 0x8000 fill pattern into the policy module (LS < 0x2000) -- the
      * runaway fill that once wiped local store and hung the job pipeline. */

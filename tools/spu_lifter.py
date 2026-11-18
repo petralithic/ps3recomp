@@ -1187,6 +1187,11 @@ class SPULifter:
             body, prologue = list(f.body_lines), []
             if getattr(self, "reg_cache", False):
                 body, prologue = _reg_cache(body)
+            else:
+                if getattr(self, "st_fuse", False):
+                    body = _st_fuse(body)
+                if getattr(self, "fx_blocks", False):
+                    body = _fx_blocks(body)
             if f.is_region:
                 lines.append(f"static void {f.name}(spu_context* SPU_RESTRICT ctx, uint32_t entry) {{")
                 lines.extend(prologue)
@@ -1310,6 +1315,154 @@ def _reg_cache(body):
 
 
 
+# --fx-blocks: one float range check per straight-line run.
+_FX_OPS = {"spu_fa", "spu_fs", "spu_fm", "spu_fma", "spu_fms", "spu_fnms", "spu_fceq", "spu_fcgt"}
+_FX_STMT = re.compile(r"^ctx->gpr\[(\d+)\] = (spu_\w+)\((.*)\);$")
+_FX_NOTE = re.compile(r"^/\*[^*]*\*/;$")
+FX_MIN_OPS = 2
+
+
+def _fx_pure(s):
+    """A line that only computes one SPU register from registers and local
+    store reads (no store, channel, call into lifted code or exit): running
+    it twice from the same inputs gives the same result."""
+    m = _FX_STMT.match(s)
+    if not m or "{" in s or ";" in m.group(3):
+        return None
+    rest = m.group(3)
+    if m.group(2) == "spu_ls_read128" and rest.startswith("ctx, "):
+        rest = rest[len("ctx, "):]
+    rest = re.sub(r"ctx->gpr\[\d+\]", "", rest.replace("spu_ls_read128(ctx,", ""))
+    return None if "ctx" in rest else m
+
+
+def _fx_blocks(body):
+    """Float ops (fa fs fm fma fms fnms fceq fcgt) each test their result (or,
+    for the compares, their operands) for the lanes where the SPU and IEEE
+    differ, and branch to an exact path that is an out-of-line call. Per op
+    that is a reduce, a move and a branch, and the possible call after every
+    op makes the compiler store every register before it and reload them
+    after, on the critical path of the float chains.
+
+    Within a run of pure lines (see _fx_pure) with at least FX_MIN_OPS float
+    ops, from the first float op to the last, the ops instead fold their test
+    into one accumulator (spu_*_fx, the same IEEE op the plain helper's fast
+    path computes) with one branch at the end of the run. When it fires, the
+    registers the run reads before writing are restored and the run is
+    executed again exactly as lifted, per-op checks and exact paths included;
+    since the lines are pure and the local store is not written in the run,
+    that gives the lifted result bit for bit. Without the fire, every op took
+    its fast path, which is what the lifted code computes then. Guarded by
+    SPU_FX_BLOCKS (spu_helpers.h): elsewhere only the lifted lines compile."""
+    out, run_raw = [], []
+
+    def flush():
+        idx = [i for i, (_, m) in enumerate(run_raw) if m and m.group(2) in _FX_OPS]
+        if len(idx) < FX_MIN_OPS:
+            out.extend(b for b, _ in run_raw)
+            return
+        lo, hi = idx[0], idx[-1]
+        out.extend(run_raw[i][0] for i in range(lo))
+        seg = run_raw[lo:hi + 1]
+        written, live_in = set(), []
+        for b, m in seg:
+            if not m:
+                continue
+            for n in re.findall(r"ctx->gpr\[(\d+)\]", m.group(3)):
+                n = int(n)
+                if n not in written and n not in live_in:
+                    live_in.append(n)
+            written.add(int(m.group(1)))
+        saved = [n for n in live_in if n in written]
+        out.append("#if SPU_FX_BLOCKS")
+        out.append("{ spu_fx_acc _fx = spu_fx_init();" +
+                   "".join(f" const spu_fx_reg _fs{n} = spu_fx_save(ctx->gpr[{n}]);" for n in saved))
+        for b, m in seg:
+            if m and m.group(2) in _FX_OPS:
+                b = b.replace(f"= {m.group(2)}(", f"= {m.group(2)}_fx(&_fx, ", 1)
+            out.append(b)
+        out.append("  if (__builtin_expect(spu_fx_bad(_fx), 0)) {" +
+                   "".join(f" ctx->gpr[{n}] = spu_fx_load(_fs{n});" for n in saved))
+        out.append("#endif")
+        out.extend(b for b, _ in seg)
+        out.append("#if SPU_FX_BLOCKS")
+        out.append("} }")
+        out.append("#endif")
+        out.extend(run_raw[i][0] for i in range(hi + 1, len(run_raw)))
+
+    for b in body:
+        s = b.strip()
+        m = None if b.endswith(":") else _fx_pure(s)
+        if m or (not b.endswith(":") and _FX_NOTE.match(s)):
+            run_raw.append((b, m))
+            continue
+        if run_raw:
+            flush()
+            run_raw = []
+        out.append(b)
+    if run_raw:
+        flush()
+    return out
+
+
+# --st-fuse: lqd / shufb / stqd to one address as one fused store.
+_ST_READ = re.compile(r"^ctx->gpr\[(\d+)\] = spu_ls_read128\(ctx, (.*)\);$")
+_ST_SHUF = re.compile(r"^ctx->gpr\[(\d+)\] = spu_shufb\(ctx->gpr\[(\d+)\], ctx->gpr\[(\d+)\], ctx->gpr\[(\d+)\]\);$")
+_ST_WRITE = re.compile(r"^spu_ls_write128\(ctx, (.*), ctx->gpr\[(\d+)\]\);$")
+
+
+def _st_fuse(body):
+    """SPU code stores a scalar by loading the quadword, inserting with shufb
+    (control from cbd/chd/cwd) and storing it back. Where, in one straight
+    run of pure lines (_fx_pure), `X = lqd ADDR; Y = shufb A, X, C; stqd Y,
+    ADDR` hold with ADDR's registers, A and C unchanged from the load to the
+    store and X unchanged from the load to the shufb, the store becomes
+    spu_ls_write128_shufb(ctx, ADDR, A, C): the shufb of what local store
+    holds at ADDR -- the same bytes, since nothing stores in between. The
+    load and the shufb stay (X and Y are still set); only the store changes,
+    so its value no longer waits on the byte reversals of the register
+    copies (spu_helpers.h)."""
+    out = list(body)
+    for k, b in enumerate(body):
+        m = _ST_WRITE.match(b.strip())
+        if not m:
+            continue
+        addr, y = m.group(1), int(m.group(2))
+        addr_regs = {int(n) for n in re.findall(r"ctx->gpr\[(\d+)\]", addr)}
+        written, j, ok = set(), None, False
+        for t in range(k - 1, -1, -1):
+            if body[t].endswith(":"):
+                break
+            st = body[t].strip()
+            if _FX_NOTE.match(st):
+                continue
+            pm = _fx_pure(st)
+            if not pm:
+                break
+            dst = int(pm.group(1))
+            if j is None:
+                if dst == y:
+                    sm = _ST_SHUF.match(st)
+                    if not sm:
+                        break
+                    a, x, c = int(sm.group(2)), int(sm.group(3)), int(sm.group(4))
+                    if y in (a, c) or written & {a, c}:
+                        break
+                    j = t
+                written.add(dst)
+                continue
+            if dst == x:
+                rm = _ST_READ.match(st)
+                ok = (bool(rm) and rm.group(2) == addr and x not in addr_regs
+                      and not (written & addr_regs))
+                break
+            written.add(dst)
+        if ok:
+            ind = b[:len(b) - len(b.lstrip())]
+            out[k] = f"{ind}spu_ls_write128_shufb(ctx, {addr}, ctx->gpr[{a}], ctx->gpr[{c}]);"
+    return out
+
+
 def lift_regions(lifter, insns, bounds, args) -> None:
     """--regions: a region starts at a call target, an explicit entry
     (--extra-funcs), the first bound, or after a gap, and takes the following
@@ -1417,6 +1570,15 @@ def main() -> None:
     p.add_argument("--reg-cache", action="store_true",
                    help="Keep SPU registers in C locals within each function, synced "
                         "with ctx->gpr only around calls into lifted code and exits.")
+    p.add_argument("--fx-blocks", action="store_true",
+                   help="Check the SPU float range once per straight-line run of float "
+                        "ops instead of once per op; a run that needs the exact path is "
+                        "redone from its saved inputs as lifted (SPU_FX_BLOCKS, "
+                        "spu_helpers.h; arm64 only, other hosts compile the plain code).")
+    p.add_argument("--st-fuse", action="store_true",
+                   help="Emit the scalar-store idiom (lqd; shufb; stqd to the same "
+                        "address) as one spu_ls_write128_shufb, which shuffles the "
+                        "local-store bytes directly (spu_helpers.h).")
     p.add_argument("--reloc", action="store_true",
                    help="Emit a relocatable image: every pc-derived address is lift "
                         "address + ctx->ls_delta + ctx->reloc_delta (wrapped to LS). The "
@@ -1549,6 +1711,8 @@ def main() -> None:
 
     lifter = SPULifter(trace=args.trace, prefix=args.symbol_prefix, reloc=args.reloc)
     lifter.reg_cache = args.reg_cache
+    lifter.fx_blocks = args.fx_blocks
+    lifter.st_fuse = args.st_fuse
     lifter.bi_r0_jump = compute_bi_r0_jumps(insns, bounds)
     if lifter.bi_r0_jump:
         print(f"  {len(lifter.bi_r0_jump)} `bi $r0` computed-jump site(s) "

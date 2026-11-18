@@ -416,6 +416,14 @@ static void raw_spu_start(raw_spu* s)
 
     /* THE point of this whole file: local store is the guest window, not a copy.
      * The PPU keeps writing command buffers into it while the SPU runs. */
+    /* Lifted code built with SPU_LS_IN_CONTEXT addresses ls_store directly
+     * (spu_context.h): it would not see this window. */
+    { extern int g_spu_ls_in_context __attribute__((weak));
+      if (&g_spu_ls_in_context && g_spu_ls_in_context) {
+          fprintf(stderr, "[spu-raw] raw SPU %u: this build's lifted SPU code was compiled with "
+                          "SPU_LS_IN_CONTEXT=1, which a raw SPU's guest-memory local store breaks; "
+                          "rebuild without it\n", n);
+          abort(); } }
     s->ctx->ls       = vm_base + s->base;
     s->ctx->image_id = image_id;
     s->entry         = entry;

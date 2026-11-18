@@ -19,7 +19,11 @@
 #include "ps3emu/nid.h"      /* ps3_compute_nid */
 #include "ps3emu/guest_call.h" /* ps3_invoke_guest: AIO completion is a guest OPD */
 #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
+#ifdef __APPLE__
 #include <zlib.h>   /* PSARC manifests (DualSense routing) */
+#else
+#include "../../../zlib/zlib.h"   /* PSARC manifests (DualSense routing) */
+#endif
 #include <string>
 #include <vector>
 #include <stdint.h>

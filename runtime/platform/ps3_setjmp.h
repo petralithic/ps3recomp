@@ -28,5 +28,14 @@ void ps3_longjmp(void* buf, int val) __attribute__((noreturn));
 #  undef longjmp
 #  define setjmp(b)     ps3_setjmp((void*)(b))
 #  define longjmp(b, v) ps3_longjmp((void*)(b), (v))
+#elif defined(__APPLE__)
+/* macOS setjmp/longjmp save and restore the signal mask: a sigprocmask
+ * system call on every SPU job halt, SPU task restart and guest setjmp (3%
+ * of the WWS job lane). No jump here leaves a signal handler or changes the
+ * mask, so use the register-only pair, which is what glibc's setjmp is. */
+#  undef setjmp
+#  undef longjmp
+#  define setjmp(b)     _setjmp(b)
+#  define longjmp(b, v) _longjmp((b), (v))
 #endif
 #endif

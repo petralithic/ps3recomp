@@ -449,7 +449,9 @@ static void* px_worker(void* p) { (void)p; px_worker_loop(); return NULL; }
 static void px_worker_loop(void)
 {
     /* PS3_SAMPLE_BE=1: the sampler profiles this thread, as PS3_SAMPLE_RSX does the walker. */
+#ifdef _WIN32
     { extern void ps3_samp_only_tid(unsigned long tid); if (getenv("PS3_SAMPLE_BE")) ps3_samp_only_tid(GetCurrentThreadId()); }
+#endif
     { char _hb[160]; snprintf(_hb, sizeof _hb, "[hosttid] %lu rsx backend worker%c", (unsigned long)GetCurrentThreadId(), 10); fputs(_hb, stderr); }
     unsigned long long r = atomic_load_explicit(&s_r, memory_order_relaxed), w = r, r_pub = r;
     for (;;) {

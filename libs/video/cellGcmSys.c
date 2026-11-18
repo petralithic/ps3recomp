@@ -2712,7 +2712,7 @@ int cellGcm_fifo_sync(u32 timeout_us)
 #ifdef _WIN32
         SwitchToThread();
 #else
-        sched_yield();
+        { extern void racacit_yield(void); racacit_yield(); }
 #endif
     }
     { static int n = 0;

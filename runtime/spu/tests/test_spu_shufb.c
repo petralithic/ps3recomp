@@ -18,6 +18,7 @@ int main(void)
         for (int i = 0; i < 16; i++) {
             a._u8[i] = (uint8_t)rand(); b._u8[i] = (uint8_t)rand();
             c._u8[i] = (uint8_t)rand();          /* covers all 256 selector values */
+            if (it & 1) c._u8[i] &= 0x7F;      /* no special selector: the common case */
         }
         u128 x = spu_shufb(a, b, c), y = spu_shufb_ref(a, b, c);
         if (memcmp(&x, &y, 16)) {

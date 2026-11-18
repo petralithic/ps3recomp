@@ -348,14 +348,45 @@ extern const ppu_inl_cfg_t ppu_inl_cfg;
 #ifdef __cplusplus
 }
 #endif
+/* The same snapshot read through a const array of scalars bound to the same
+ * symbol. C++ never treats an extern const declaration of a *class* type as
+ * constant storage (its definition might have a dynamic initializer), so the
+ * compiler had to assume any guest store -- which may alias anything -- could
+ * change it, and reloaded base, lo and span (through the GOT) at every guest
+ * access. A const array of integers is constant storage: the loads become
+ * invariant, so they are hoisted, CSE'd and rematerialized instead. The values
+ * are the ones ppu_inl_cfg_refresh writes before any lifted code runs, and it
+ * never writes them again; lifted code that ran before it saw span 0 then and
+ * still does. Layout: { base, span, lo | hole << 32 }. */
+#if defined(__cplusplus) && (defined(__clang__) || defined(__GNUC__))
+#if defined(__APPLE__)
+extern "C" const uint64_t ppu_inl_cfg_q[3] __asm__("_ppu_inl_cfg");
+#else
+extern "C" const uint64_t ppu_inl_cfg_q[3] __asm__("ppu_inl_cfg");
+#endif
+#define PPU_INL_BASE ((uint8_t*)(uintptr_t)ppu_inl_cfg_q[0])
+#define PPU_INL_SPAN (ppu_inl_cfg_q[1])
+#define PPU_INL_LO   ((uint32_t)ppu_inl_cfg_q[2])
+#define PPU_INL_HOLE ((uint32_t)(ppu_inl_cfg_q[2] >> 32))
+#else
+#define PPU_INL_BASE ppu_inl_cfg.base
+#define PPU_INL_LO   ppu_inl_cfg.lo
+#define PPU_INL_SPAN ppu_inl_cfg.span
+#define PPU_INL_HOLE ppu_inl_cfg.hole
+#endif
 static inline int ppu_inl_ok(uint32_t ea, uint32_t n)
 {
-    if ((uint64_t)(uint32_t)(ea - ppu_inl_cfg.lo) + n > ppu_inl_cfg.span) return 0;
+    if ((uint64_t)(uint32_t)(ea - PPU_INL_LO) + n > PPU_INL_SPAN) return 0;
 #if !defined(PPU_INL_NO_HOLE)   /* a port whose ppu_run clips the window at the hole (ppu_inl_clip_hole) */
-    if ((uint32_t)(ea - ppu_inl_cfg.hole) < 0x1000u) return 0;
+    if ((uint32_t)(ea - PPU_INL_HOLE) < 0x1000u) return 0;
 #endif
     return 1;
 }
+/* No spu_coh_armed_g test: the runtime sets a line's bitmap bit and then
+ * spu_coh_armed_g, and never clears the flag, so while it reads 0 the bitmap
+ * is all zero (the one exception, a bit set an instant before the flag, sends
+ * the store to vm_write*, which does the same plain store then). Armed -- all
+ * of gameplay -- the flag test was a load and a branch on every store. */
 static inline int ppu_inl_wok(uint32_t ea, uint32_t n)
 {
     if (!ppu_inl_ok(ea, n)) return 0;
@@ -373,21 +404,21 @@ typedef uint16_t __attribute__((aligned(1))) ppu_vu16;
 typedef uint32_t __attribute__((aligned(1))) ppu_vu32;
 typedef uint64_t __attribute__((aligned(1))) ppu_vu64;
 static inline uint8_t ppu_inl_read8(uint64_t a)
-{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 1), 1)) return *(volatile uint8_t*)(ppu_inl_cfg.base + e); return vm_read8(a); }
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 1), 1)) return *(volatile uint8_t*)(PPU_INL_BASE + e); return vm_read8(a); }
 static inline uint16_t ppu_inl_read16(uint64_t a)
-{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 2), 1)) { uint16_t v = *(volatile ppu_vu16*)(ppu_inl_cfg.base + e); return __builtin_bswap16(v); } return vm_read16(a); }
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 2), 1)) { uint16_t v = *(volatile ppu_vu16*)(PPU_INL_BASE + e); return __builtin_bswap16(v); } return vm_read16(a); }
 static inline uint32_t ppu_inl_read32(uint64_t a)
-{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 4), 1)) { uint32_t v = *(volatile ppu_vu32*)(ppu_inl_cfg.base + e); return __builtin_bswap32(v); } return vm_read32(a); }
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 4), 1)) { uint32_t v = *(volatile ppu_vu32*)(PPU_INL_BASE + e); return __builtin_bswap32(v); } return vm_read32(a); }
 static inline uint64_t ppu_inl_read64(uint64_t a)
-{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 8), 1)) { uint64_t v = *(volatile ppu_vu64*)(ppu_inl_cfg.base + e); return __builtin_bswap64(v); } return vm_read64(a); }
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 8), 1)) { uint64_t v = *(volatile ppu_vu64*)(PPU_INL_BASE + e); return __builtin_bswap64(v); } return vm_read64(a); }
 static inline void ppu_inl_write8(uint64_t a, uint8_t v)
-{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 1), 1)) { *(volatile uint8_t*)(ppu_inl_cfg.base + e) = v; return; } vm_write8(a, v); }
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 1), 1)) { *(volatile uint8_t*)(PPU_INL_BASE + e) = v; return; } vm_write8(a, v); }
 static inline void ppu_inl_write16(uint64_t a, uint16_t v)
-{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 2), 1)) { const uint16_t s = __builtin_bswap16(v); *(volatile ppu_vu16*)(ppu_inl_cfg.base + e) = s; return; } vm_write16(a, v); }
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 2), 1)) { const uint16_t s = __builtin_bswap16(v); *(volatile ppu_vu16*)(PPU_INL_BASE + e) = s; return; } vm_write16(a, v); }
 static inline void ppu_inl_write32(uint64_t a, uint32_t v)
-{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 4), 1)) { const uint32_t s = __builtin_bswap32(v); *(volatile ppu_vu32*)(ppu_inl_cfg.base + e) = s; return; } vm_write32(a, v); }
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 4), 1)) { const uint32_t s = __builtin_bswap32(v); *(volatile ppu_vu32*)(PPU_INL_BASE + e) = s; return; } vm_write32(a, v); }
 static inline void ppu_inl_write64(uint64_t a, uint64_t v)
-{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 8), 1)) { const uint64_t s = __builtin_bswap64(v); *(volatile ppu_vu64*)(ppu_inl_cfg.base + e) = s; return; } vm_write64(a, v); }
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 8), 1)) { const uint64_t s = __builtin_bswap64(v); *(volatile ppu_vu64*)(PPU_INL_BASE + e) = s; return; } vm_write64(a, v); }
 #define vm_read8   ppu_inl_read8
 #define vm_read16  ppu_inl_read16
 #define vm_read32  ppu_inl_read32
@@ -549,12 +580,15 @@ static inline double ppu_fp_default_qnan(void)
  * new NaN (inf - inf, 0 * inf) has its sign bit set. Only for a title whose
  * output does not depend on NaN bits. */
 #ifndef PPU_FAST_FP
+/* A NaN operand always makes the IEEE result NaN, so a non-NaN result proves
+ * both operands were numbers: one compare on the common path, and the operand
+ * order only matters once the result is known to be NaN. Same values. */
 static inline double ppu_fp_bin(double a, double b, double r)
 {
+    if (__builtin_expect(r == r, 1)) return r;
     if (a != a) return ppu_fp_quiet(a);
     if (b != b) return ppu_fp_quiet(b);
-    if (r != r) return ppu_fp_default_qnan();
-    return r;
+    return ppu_fp_default_qnan();
 }
 #else
 static inline double ppu_fp_bin(double a, double b, double r) { (void)a; (void)b; return r; }
@@ -568,15 +602,17 @@ static inline double ppu_fdiv(double a, double b) { return ppu_fp_bin(a, b, a / 
 static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int neg_res)
 {
 #ifndef PPU_FAST_FP
+    /* fma() of a NaN operand is NaN: a number result means none was (see ppu_fp_bin) */
+    double r = fma(a, c, neg_b ? -b : b);
+    if (__builtin_expect(r == r, 1)) return neg_res ? -r : r;
     if (a != a) return ppu_fp_quiet(a);
     if (b != b) return ppu_fp_quiet(b);
     if (c != c) return ppu_fp_quiet(c);
-    double r = fma(a, c, neg_b ? -b : b);
-    if (r != r) return ppu_fp_default_qnan();
+    return ppu_fp_default_qnan();
 #else
     double r = fma(a, c, neg_b ? -b : b);
-#endif
     return neg_res ? -r : r;
+#endif
 }
 /* Round to single: the result must be representable in single format, NaNs
  * included -- their payload is truncated to the single fraction (as RPCS3). */

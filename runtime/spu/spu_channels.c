@@ -719,7 +719,7 @@ found:
 #ifdef _WIN32
         SwitchToThread();
 #else
-        sched_yield();
+        { extern void racacit_yield(void); racacit_yield(); }
 #endif
         return;
     }
@@ -1439,9 +1439,34 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
 
 /* Signal the per-SPU wait CV so a blocked spu_rdch re-checks its predicate.
  * MUST be called by every producer AFTER it makes a read predicate true. */
+/* racacit: only a context that is ASLEEP on its channel CV needs the CV
+ * broadcast. spu_ch_wake runs on every notify -- every PPU store / stwcx.
+ * into a reserved line and every committing PUTLLC, under the lock-line
+ * lock -- and the broadcast (the CV object's mutex plus the broadcast) was
+ * paid there even though the waiter was spinning, which is where it almost
+ * always is (SPU_LR_STATS: no wait ever ended by a notify after sleeping).
+ * Sleepers count themselves in a small table hashed by context (a collision
+ * only costs a needless broadcast); the waker publishes its predicate, then
+ * fences and reads the count, the sleeper bumps the count, then fences and
+ * re-reads the predicate -- one of the two always sees the other. The sleeps
+ * are also bounded, so nothing can hang on a missed wake.
+ * SPU_WAKE_ALWAYS=1: broadcast on every wake as before. */
+static volatile long s_ch_sleepers[256];
+static inline volatile long* spu_ch_sleep_slot(const spu_context* c)
+{ const uintptr_t p = (uintptr_t)c; return &s_ch_sleepers[((p >> 6) ^ (p >> 14)) & 255u]; }
+static void spu_ch_sleep_enter(const spu_context* c)
+{ InterlockedIncrement(spu_ch_sleep_slot(c)); MemoryBarrier(); }
+static void spu_ch_sleep_leave(const spu_context* c)
+{ InterlockedDecrement(spu_ch_sleep_slot(c)); }
 void spu_ch_wake(spu_context* ctx)
 {
     if (!ctx) return;
+    static int s_always = -1;
+    if (s_always < 0) { const char* e = getenv("SPU_WAKE_ALWAYS"); s_always = (e && *e && *e != '0') ? 1 : 0; }
+    if (!s_always) {
+        MemoryBarrier();
+        if (!*spu_ch_sleep_slot(ctx)) return;
+    }
     /* Pass through the waiter's lock first. spu_ch_wait tests its predicate and
      * goes to sleep under ch_wait_lock, but a producer makes the predicate true
      * outside it. A wake issued between the waiter's test and its sleep found
@@ -1497,11 +1522,13 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                 yz_lockstep_block_end(ctx);
                 spu_honour_stop_request(ctx);
             }
+            spu_ch_sleep_enter(ctx);
             AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
             if (!spu_ch_ready(ctx, channel))
                 SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
                                           (SRWLOCK*)&ctx->ch_wait_lock, 10, 0);
             ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+            spu_ch_sleep_leave(ctx);
             unsigned long long waited = GetTickCount64() - start;
             if (waited >= next_hb) {
                 fprintf(stderr, "[ch-wait] spu=%X pc=0x%05X ch=%u waited=%llums evstat=0x%X evmask=0x%X resv[valid=%d ea=0x%08X]\n",
@@ -1563,6 +1590,24 @@ static void spu_lr_waitlog(spu_context* ctx, unsigned long long us)
     ReleaseSRWLockExclusive(&lk);
 }
 
+/* The lane wait's clock. On macOS QueryPerformanceCounter is
+ * clock_gettime(CLOCK_MONOTONIC), which goes through the boot time and
+ * gettimeofday (now and then a real syscall) -- half of a waiting lane's
+ * samples, read once per spin iteration. The wait only needs elapsed time,
+ * so it reads mach_absolute_time (the commpage counter) there. */
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+static inline void SPU_LRW_NOW(LARGE_INTEGER* t) { t->QuadPart = (LONGLONG)mach_absolute_time(); }
+static inline void SPU_LRW_FREQ(LARGE_INTEGER* f)
+{
+    static LONGLONG s_f;
+    if (!s_f) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); s_f = (LONGLONG)(1000000000.0 * (double)tb.denom / (double)tb.numer); }
+    f->QuadPart = s_f;
+}
+#else
+#define SPU_LRW_NOW(t)  QueryPerformanceCounter(t)
+#define SPU_LRW_FREQ(f) QueryPerformanceFrequency(f)
+#endif
 /* The lanes' spin before sleeping (us), live from Settings > Graphics > CPU
  * usage (rsx_host_ui.c): 30 efficient, 200 maximum. */
 volatile int g_racacit_spu_spin_us = 30;
@@ -1577,7 +1622,7 @@ static void spu_lr_wait(spu_context* ctx)
     if (s_us < 0) { const char* e = getenv("SPU_LR_WAIT_US"); s_us = e ? atol(e) : 200; }
     if (s_us <= 0 || !(ctx->event_mask & 0x400u)) return;
     if ((ctx->event_status & ctx->event_mask) || !ctx->resv_valid) return;
-    LARGE_INTEGER f, t0, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t0);
+    LARGE_INTEGER f, t0, t; SPU_LRW_FREQ(&f); SPU_LRW_NOW(&t0);
     /* SPU_LR_SPIN_US=<us>: how long to spin on the line before sleeping on
      * the channel CV (woken by any writer that kills the reservation). It was
      * 200, the whole bound: a parked lane never slept, and the six lanes held
@@ -1610,7 +1655,7 @@ extern _Thread_local unsigned long long t_spu_job_wait_us;   /* spu_drain.c, SPU
         spu_resv_lost_poll(ctx);
         if ((ctx->event_status & ctx->event_mask) || !ctx->resv_valid) {
             SPU_LR_STAT(slept ? 2 : 0); SPU_LR_WAIT_DONE(); return; }
-        QueryPerformanceCounter(&t);
+        SPU_LRW_NOW(&t);
         if (t.QuadPart - t0.QuadPart >= lim) {
             SPU_LR_STAT(3); SPU_LR_WAIT_DONE();
             /* SPU_LR_STATS: which lines the waits that time out are on. */
@@ -1626,11 +1671,13 @@ extern _Thread_local unsigned long long t_spu_job_wait_us;   /* spu_drain.c, SPU
             return; }
         if (t.QuadPart - t0.QuadPart < spin) { YieldProcessor(); continue; }
         yz_lockstep_block_begin(ctx);
+        spu_ch_sleep_enter(ctx);
         AcquireSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
         if (!(ctx->event_status & ctx->event_mask) && ctx->resv_valid)
             SleepConditionVariableSRW((CONDITION_VARIABLE*)&ctx->ch_wait_cv,
                                       (SRWLOCK*)&ctx->ch_wait_lock, 1, 0);
         ReleaseSRWLockExclusive((SRWLOCK*)&ctx->ch_wait_lock);
+        spu_ch_sleep_leave(ctx);
         yz_lockstep_block_end(ctx);
         slept = 1;
     }
@@ -4309,6 +4356,11 @@ static _Thread_local struct { uint32_t cmd, lsa, ea, size; } s_dring[128];
 static _Thread_local uint32_t s_dring_i;
 void spu_dma_ring_note(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size)
 {
+    /* Every SPU transfer lands here, and on macOS each thread-local access is
+     * a _tlv_get_addr call: keep the ring only when asked, SPU_DMA_RING=1. */
+    static int s_on = -1;
+    if (__builtin_expect(s_on < 0, 0)) s_on = getenv("SPU_DMA_RING") ? 1 : 0;
+    if (!s_on) return;
     const uint32_t k = s_dring_i++ & 127u;
     s_dring[k].cmd = cmd; s_dring[k].lsa = lsa; s_dring[k].ea = ea; s_dring[k].size = size;
 }

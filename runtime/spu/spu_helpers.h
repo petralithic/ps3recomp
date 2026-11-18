@@ -483,6 +483,28 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
 }
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
+#if !defined(SPU_SHUFB_SWAP)
+/* racacit: one two-register table lookup in host byte order. SPU byte P is
+ * host byte P ^ 3 (each 32-bit word reversed) in a, b, c and the result
+ * alike, so the control byte for a result byte is already at that byte's
+ * host position, and the source it names, SPU byte s of a:b, is host byte
+ * s ^ 3 of the same pair. The special selectors (control >= 0x80) are rare
+ * and take a branch. SPU_SHUFB_SWAP keeps upstream's version, which swaps
+ * a, b, c and the result into SPU order around the lookup. */
+static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
+    const uint8x16_t C = vld1q_u8(c._u8);
+    const uint8x16x2_t AB = { { vld1q_u8(a._u8), vld1q_u8(b._u8) } };
+    uint8x16_t r = vqtbl2q_u8(AB, veorq_u8(vandq_u8(C, vdupq_n_u8(0x1F)), vdupq_n_u8(3)));
+    if (__builtin_expect(vmaxvq_u8(C) >= 0x80, 0)) {
+        /* Special selectors: 10x -> 0x00, 110 -> 0xFF, 111 -> 0x80. */
+        const uint8x16_t m80 = vtstq_u8(C, vdupq_n_u8(0x80));
+        const uint8x16_t mC0 = vceqq_u8(vandq_u8(C, vdupq_n_u8(0xC0)), vdupq_n_u8(0xC0));
+        const uint8x16_t mE0 = vceqq_u8(vandq_u8(C, vdupq_n_u8(0xE0)), vdupq_n_u8(0xE0));
+        r = vbslq_u8(m80, vbslq_u8(mE0, vdupq_n_u8(0x80), mC0), r);
+    }
+    u128 out; vst1q_u8(out._u8, r); return out;
+}
+#else
 /* NEON version: tbl over the 32-byte {a,b} concatenation. SPU byte P lives at
  * host byte P^3 (each word's bytes reversed), so rev32 into SPU order,
  * select, and rev32 back. */
@@ -500,6 +522,7 @@ static inline u128 spu_shufb(u128 a, u128 b, u128 c) {
     r = vrev32q_u8(vbslq_u8(m80, special, r));
     u128 out; vst1q_u8(out._u8, r); return out;
 }
+#endif
 #endif
 #if defined(__SSE4_1__) || defined(__ARM_NEON)
 /* The byte loop stays as the reference (tests/test_spu_shufb.c checks both). */
@@ -1294,6 +1317,20 @@ SPU__SSE_CMP(spu_fcgt,  _mm_cmpgt_epi32, spu__sse_key)
 SPU__SSE_CMP(spu_fcmeq, _mm_cmpeq_epi32, spu__sse_mag)
 SPU__SSE_CMP(spu_fcmgt, _mm_cmpgt_epi32, spu__sse_mag)
 #undef SPU__SSE_CMP
+#elif defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS)
+/* racacit: the SSE2 forms above in NEON (the _ref loops stay scalar and
+ * branchy on arm64 too, and fceq/fcgt are hot in A Crack in Time's jobs). */
+static inline uint32x4_t spu__nvc_mag(uint32x4_t x) {
+    return vbicq_u32(vandq_u32(x, vdupq_n_u32(0x7FFFFFFFu)), vceqzq_u32(vandq_u32(x, vdupq_n_u32(0x7F800000u))));
+}
+static inline int32x4_t spu__nvc_key(uint32x4_t x) {
+    const int32x4_t neg = vshrq_n_s32(vreinterpretq_s32_u32(x), 31);
+    return vsubq_s32(veorq_s32(vreinterpretq_s32_u32(spu__nvc_mag(x)), neg), neg);
+}
+static inline u128 spu_fceq(u128 a, u128 b)  { u128 r; vst1q_u32(r._u32, vceqq_s32(spu__nvc_key(vld1q_u32(a._u32)), spu__nvc_key(vld1q_u32(b._u32)))); return r; }
+static inline u128 spu_fcgt(u128 a, u128 b)  { u128 r; vst1q_u32(r._u32, vcgtq_s32(spu__nvc_key(vld1q_u32(a._u32)), spu__nvc_key(vld1q_u32(b._u32)))); return r; }
+static inline u128 spu_fcmeq(u128 a, u128 b) { u128 r; vst1q_u32(r._u32, vceqq_u32(spu__nvc_mag(vld1q_u32(a._u32)), spu__nvc_mag(vld1q_u32(b._u32)))); return r; }
+static inline u128 spu_fcmgt(u128 a, u128 b) { u128 r; vst1q_u32(r._u32, vcgtq_u32(spu__nvc_mag(vld1q_u32(a._u32)), spu__nvc_mag(vld1q_u32(b._u32)))); return r; }
 #else
 static inline u128 spu_fceq(u128 a, u128 b)  { return spu_fceq_ref(a, b); }
 static inline u128 spu_fcgt(u128 a, u128 b)  { return spu_fcgt_ref(a, b); }
@@ -2491,6 +2528,517 @@ static inline u128 spu_gbb(u128 a) { return spu_gbb_ref(a); }
 static inline u128 spu_fsm(u128 a) { return spu_fsm_ref(a); }
 static inline u128 spu_fsmh(u128 a) { return spu_fsmh_ref(a); }
 static inline u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
+#endif
+
+
+/* ==== racacit: A Crack in Time's arm64 SPU codegen (mac-perf) ====
+ * Byte-table controls for the quadword byte rotates/shifts and the insertion
+ * controls (host byte h <- host byte SPU_W((SPU_W(h)+sh) & 15)), the lane ops
+ * as single NEON instructions, --fx-blocks, and the hot helpers as statement
+ * expressions. The float helpers are upstream's (no float macros here). */
+#if defined(__aarch64__) && !defined(SPU_SCALAR_LANES)
+static const uint8_t spu__rotqby_ctl[16][16] __attribute__((aligned(16))) = {
+    {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F},
+    {0x07,0x00,0x01,0x02,0x0B,0x04,0x05,0x06,0x0F,0x08,0x09,0x0A,0x03,0x0C,0x0D,0x0E},
+    {0x06,0x07,0x00,0x01,0x0A,0x0B,0x04,0x05,0x0E,0x0F,0x08,0x09,0x02,0x03,0x0C,0x0D},
+    {0x05,0x06,0x07,0x00,0x09,0x0A,0x0B,0x04,0x0D,0x0E,0x0F,0x08,0x01,0x02,0x03,0x0C},
+    {0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x00,0x01,0x02,0x03},
+    {0x0B,0x04,0x05,0x06,0x0F,0x08,0x09,0x0A,0x03,0x0C,0x0D,0x0E,0x07,0x00,0x01,0x02},
+    {0x0A,0x0B,0x04,0x05,0x0E,0x0F,0x08,0x09,0x02,0x03,0x0C,0x0D,0x06,0x07,0x00,0x01},
+    {0x09,0x0A,0x0B,0x04,0x0D,0x0E,0x0F,0x08,0x01,0x02,0x03,0x0C,0x05,0x06,0x07,0x00},
+    {0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07},
+    {0x0F,0x08,0x09,0x0A,0x03,0x0C,0x0D,0x0E,0x07,0x00,0x01,0x02,0x0B,0x04,0x05,0x06},
+    {0x0E,0x0F,0x08,0x09,0x02,0x03,0x0C,0x0D,0x06,0x07,0x00,0x01,0x0A,0x0B,0x04,0x05},
+    {0x0D,0x0E,0x0F,0x08,0x01,0x02,0x03,0x0C,0x05,0x06,0x07,0x00,0x09,0x0A,0x0B,0x04},
+    {0x0C,0x0D,0x0E,0x0F,0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B},
+    {0x03,0x0C,0x0D,0x0E,0x07,0x00,0x01,0x02,0x0B,0x04,0x05,0x06,0x0F,0x08,0x09,0x0A},
+    {0x02,0x03,0x0C,0x0D,0x06,0x07,0x00,0x01,0x0A,0x0B,0x04,0x05,0x0E,0x0F,0x08,0x09},
+    {0x01,0x02,0x03,0x0C,0x05,0x06,0x07,0x00,0x09,0x0A,0x0B,0x04,0x0D,0x0E,0x0F,0x08}
+};
+static const uint8_t spu__shlqby_ctl[16][16] __attribute__((aligned(16))) = {
+    {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F},
+    {0x07,0x00,0x01,0x02,0x0B,0x04,0x05,0x06,0x0F,0x08,0x09,0x0A,0x80,0x0C,0x0D,0x0E},
+    {0x06,0x07,0x00,0x01,0x0A,0x0B,0x04,0x05,0x0E,0x0F,0x08,0x09,0x80,0x80,0x0C,0x0D},
+    {0x05,0x06,0x07,0x00,0x09,0x0A,0x0B,0x04,0x0D,0x0E,0x0F,0x08,0x80,0x80,0x80,0x0C},
+    {0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80},
+    {0x0B,0x04,0x05,0x06,0x0F,0x08,0x09,0x0A,0x80,0x0C,0x0D,0x0E,0x80,0x80,0x80,0x80},
+    {0x0A,0x0B,0x04,0x05,0x0E,0x0F,0x08,0x09,0x80,0x80,0x0C,0x0D,0x80,0x80,0x80,0x80},
+    {0x09,0x0A,0x0B,0x04,0x0D,0x0E,0x0F,0x08,0x80,0x80,0x80,0x0C,0x80,0x80,0x80,0x80},
+    {0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+    {0x0F,0x08,0x09,0x0A,0x80,0x0C,0x0D,0x0E,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+    {0x0E,0x0F,0x08,0x09,0x80,0x80,0x0C,0x0D,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+    {0x0D,0x0E,0x0F,0x08,0x80,0x80,0x80,0x0C,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+    {0x0C,0x0D,0x0E,0x0F,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+    {0x80,0x0C,0x0D,0x0E,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+    {0x80,0x80,0x0C,0x0D,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80},
+    {0x80,0x80,0x80,0x0C,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80}
+};
+static const uint8_t spu__rotqmby_ctl[16][16] __attribute__((aligned(16))) = {
+    {0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F},
+    {0x01,0x02,0x03,0x80,0x05,0x06,0x07,0x00,0x09,0x0A,0x0B,0x04,0x0D,0x0E,0x0F,0x08},
+    {0x02,0x03,0x80,0x80,0x06,0x07,0x00,0x01,0x0A,0x0B,0x04,0x05,0x0E,0x0F,0x08,0x09},
+    {0x03,0x80,0x80,0x80,0x07,0x00,0x01,0x02,0x0B,0x04,0x05,0x06,0x0F,0x08,0x09,0x0A},
+    {0x80,0x80,0x80,0x80,0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0A,0x0B},
+    {0x80,0x80,0x80,0x80,0x01,0x02,0x03,0x80,0x05,0x06,0x07,0x00,0x09,0x0A,0x0B,0x04},
+    {0x80,0x80,0x80,0x80,0x02,0x03,0x80,0x80,0x06,0x07,0x00,0x01,0x0A,0x0B,0x04,0x05},
+    {0x80,0x80,0x80,0x80,0x03,0x80,0x80,0x80,0x07,0x00,0x01,0x02,0x0B,0x04,0x05,0x06},
+    {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07},
+    {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x01,0x02,0x03,0x80,0x05,0x06,0x07,0x00},
+    {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x02,0x03,0x80,0x80,0x06,0x07,0x00,0x01},
+    {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x03,0x80,0x80,0x80,0x07,0x00,0x01,0x02},
+    {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x00,0x01,0x02,0x03},
+    {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x01,0x02,0x03,0x80},
+    {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x02,0x03,0x80,0x80},
+    {0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x80,0x03,0x80,0x80,0x80}
+};
+static const uint8_t spu__cbd_ctl[16][16] __attribute__((aligned(16))) = {
+    {0x13,0x12,0x11,0x03,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x03,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x03,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x03,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x03,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x03,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x03,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x03,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x03,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x03,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x03,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x03,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x03},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x03,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x03,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x03,0x1E,0x1D,0x1C}
+};
+static const uint8_t spu__chd_ctl[8][16] __attribute__((aligned(16))) = {
+    {0x13,0x12,0x03,0x02,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x03,0x02,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x03,0x02,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x03,0x02,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x03,0x02,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x03,0x02,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x03,0x02},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x03,0x02,0x1D,0x1C}
+};
+static const uint8_t spu__cwd_ctl[4][16] __attribute__((aligned(16))) = {
+    {0x03,0x02,0x01,0x00,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x03,0x02,0x01,0x00,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x03,0x02,0x01,0x00,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x1B,0x1A,0x19,0x18,0x03,0x02,0x01,0x00}
+};
+static const uint8_t spu__cdd_ctl[2][16] __attribute__((aligned(16))) = {
+    {0x03,0x02,0x01,0x00,0x07,0x06,0x05,0x04,0x1B,0x1A,0x19,0x18,0x1F,0x1E,0x1D,0x1C},
+    {0x13,0x12,0x11,0x10,0x17,0x16,0x15,0x14,0x03,0x02,0x01,0x00,0x07,0x06,0x05,0x04}
+};
+#endif
+
+/* ---- arm64: lane ops as single NEON instructions ----
+ * The loops above are written per _u32/_u16/_u8 lane of the u128 union, which
+ * clang keeps as a pair of 64-bit integers: a word add becomes masked 64-bit
+ * GPR arithmetic (and/add/bfxil per half), a halfword add ~20 instructions,
+ * and a value moves between GPRs and NEON registers around every shuffle or
+ * local-store access. Each op below is the same lane-wise function as the
+ * loop it replaces (two's-complement wrap, all-ones/zero compare masks; lane
+ * i of the vector is _u32[i]/_u16[i]/_u8[i], so the union's host byte order
+ * is unchanged), as one NEON instruction on a value that stays in a vector
+ * register. SPU_SCALAR_LANES keeps the loops. */
+#if defined(__aarch64__) && !defined(SPU_SCALAR_LANES)
+static inline uint32x4_t spu__w(u128 a) { return vld1q_u32(a._u32); }
+static inline uint16x8_t spu__h(u128 a) { return vld1q_u16(a._u16); }
+static inline uint8x16_t spu__b(u128 a) { return vld1q_u8(a._u8); }
+static inline u128 spu__fw(uint32x4_t v) { u128 r; vst1q_u32(r._u32, v); return r; }
+static inline u128 spu__fh(uint16x8_t v) { u128 r; vst1q_u16(r._u16, v); return r; }
+static inline u128 spu__fb(uint8x16_t v) { u128 r; vst1q_u8(r._u8, v); return r; }
+static inline u128 spu_a_nl(u128 a, u128 b)   { return spu__fw(vaddq_u32(spu__w(a), spu__w(b))); }
+static inline u128 spu_sf_nl(u128 a, u128 b)  { return spu__fw(vsubq_u32(spu__w(b), spu__w(a))); }
+static inline u128 spu_ah_nl(u128 a, u128 b)  { return spu__fh(vaddq_u16(spu__h(a), spu__h(b))); }
+static inline u128 spu_sfh_nl(u128 a, u128 b) { return spu__fh(vsubq_u16(spu__h(b), spu__h(a))); }
+static inline u128 spu_ai_nl(u128 a, int32_t i)  { return spu__fw(vaddq_u32(spu__w(a), vdupq_n_u32((uint32_t)i))); }
+static inline u128 spu_ahi_nl(u128 a, int32_t i) { return spu__fh(vaddq_u16(spu__h(a), vdupq_n_u16((uint16_t)i))); }
+static inline u128 spu_sfi_nl(u128 a, int32_t i) { return spu__fw(vsubq_u32(vdupq_n_u32((uint32_t)i), spu__w(a))); }
+static inline u128 spu_sfhi_nl(u128 a, int32_t i){ return spu__fh(vsubq_u16(vdupq_n_u16((uint16_t)i), spu__h(a))); }
+static inline u128 spu_and_nl(u128 a, u128 b)  { return spu__fw(vandq_u32(spu__w(a), spu__w(b))); }
+static inline u128 spu_or_nl(u128 a, u128 b)   { return spu__fw(vorrq_u32(spu__w(a), spu__w(b))); }
+static inline u128 spu_xor_nl(u128 a, u128 b)  { return spu__fw(veorq_u32(spu__w(a), spu__w(b))); }
+static inline u128 spu_nand_nl(u128 a, u128 b) { return spu__fw(vmvnq_u32(vandq_u32(spu__w(a), spu__w(b)))); }
+static inline u128 spu_nor_nl(u128 a, u128 b)  { return spu__fw(vmvnq_u32(vorrq_u32(spu__w(a), spu__w(b)))); }
+static inline u128 spu_andc_nl(u128 a, u128 b) { return spu__fw(vbicq_u32(spu__w(a), spu__w(b))); }
+static inline u128 spu_orc_nl(u128 a, u128 b)  { return spu__fw(vornq_u32(spu__w(a), spu__w(b))); }
+static inline u128 spu_andi_nl(u128 a, int32_t i) { return spu__fw(vandq_u32(spu__w(a), vdupq_n_u32((uint32_t)i))); }
+static inline u128 spu_ori_nl(u128 a, int32_t i)  { return spu__fw(vorrq_u32(spu__w(a), vdupq_n_u32((uint32_t)i))); }
+static inline u128 spu_xori_nl(u128 a, int32_t i) { return spu__fw(veorq_u32(spu__w(a), vdupq_n_u32((uint32_t)i))); }
+static inline u128 spu_andhi_nl(u128 a, int32_t i){ return spu__fh(vandq_u16(spu__h(a), vdupq_n_u16((uint16_t)i))); }
+static inline u128 spu_orhi_nl(u128 a, int32_t i) { return spu__fh(vorrq_u16(spu__h(a), vdupq_n_u16((uint16_t)i))); }
+static inline u128 spu_andbi_nl(u128 a, int32_t i){ return spu__fb(vandq_u8(spu__b(a), vdupq_n_u8((uint8_t)i))); }
+static inline u128 spu_orbi_nl(u128 a, int32_t i) { return spu__fb(vorrq_u8(spu__b(a), vdupq_n_u8((uint8_t)i))); }
+static inline u128 spu_xorbi_nl(u128 a, int32_t i){ return spu__fb(veorq_u8(spu__b(a), vdupq_n_u8((uint8_t)i))); }
+static inline u128 spu_iohl_nl(u128 a, uint16_t i){ return spu__fw(vorrq_u32(spu__w(a), vdupq_n_u32((uint32_t)i))); }
+static inline u128 spu_ceq_nl(u128 a, u128 b)  { return spu__fw(vceqq_u32(spu__w(a), spu__w(b))); }
+static inline u128 spu_ceqh_nl(u128 a, u128 b) { return spu__fh(vceqq_u16(spu__h(a), spu__h(b))); }
+static inline u128 spu_ceqb_nl(u128 a, u128 b) { return spu__fb(vceqq_u8(spu__b(a), spu__b(b))); }
+static inline u128 spu_cgt_nl(u128 a, u128 b)  { return spu__fw(vcgtq_s32(vreinterpretq_s32_u32(spu__w(a)), vreinterpretq_s32_u32(spu__w(b)))); }
+static inline u128 spu_cgth_nl(u128 a, u128 b) { return spu__fh(vcgtq_s16(vreinterpretq_s16_u16(spu__h(a)), vreinterpretq_s16_u16(spu__h(b)))); }
+static inline u128 spu_cgtb_nl(u128 a, u128 b) { return spu__fb(vcgtq_s8(vreinterpretq_s8_u8(spu__b(a)), vreinterpretq_s8_u8(spu__b(b)))); }
+static inline u128 spu_clgt_nl(u128 a, u128 b) { return spu__fw(vcgtq_u32(spu__w(a), spu__w(b))); }
+static inline u128 spu_clgth_nl(u128 a, u128 b){ return spu__fh(vcgtq_u16(spu__h(a), spu__h(b))); }
+static inline u128 spu_clgtb_nl(u128 a, u128 b){ return spu__fb(vcgtq_u8(spu__b(a), spu__b(b))); }
+static inline u128 spu_ceqi_nl(u128 a, int32_t i)  { return spu__fw(vceqq_u32(spu__w(a), vdupq_n_u32((uint32_t)i))); }
+static inline u128 spu_ceqhi_nl(u128 a, int32_t i) { return spu__fh(vceqq_u16(spu__h(a), vdupq_n_u16((uint16_t)i))); }
+static inline u128 spu_ceqbi_nl(u128 a, int32_t i) { return spu__fb(vceqq_u8(spu__b(a), vdupq_n_u8((uint8_t)i))); }
+static inline u128 spu_cgti_nl(u128 a, int32_t i)  { return spu__fw(vcgtq_s32(vreinterpretq_s32_u32(spu__w(a)), vdupq_n_s32(i))); }
+static inline u128 spu_clgti_nl(u128 a, int32_t i) { return spu__fw(vcgtq_u32(spu__w(a), vdupq_n_u32((uint32_t)i))); }
+static inline u128 spu_cgthi_nl(u128 a, int32_t i) { return spu__fh(vcgtq_s16(vreinterpretq_s16_u16(spu__h(a)), vdupq_n_s16((int16_t)i))); }
+static inline u128 spu_clgthi_nl(u128 a, int32_t i){ return spu__fh(vcgtq_u16(spu__h(a), vdupq_n_u16((uint16_t)i))); }
+static inline u128 spu_cgtbi_nl(u128 a, int32_t i) { return spu__fb(vcgtq_s8(vreinterpretq_s8_u8(spu__b(a)), vdupq_n_s8((int8_t)i))); }
+static inline u128 spu_clgtbi_nl(u128 a, int32_t i){ return spu__fb(vcgtq_u8(spu__b(a), vdupq_n_u8((uint8_t)i))); }
+static inline u128 spu_selb_nl(u128 a, u128 b, u128 c) { return spu__fw(vbslq_u32(spu__w(c), spu__w(b), spu__w(a))); }
+static inline u128 spu_xsbh_nl(u128 a) { return spu__fh(vreinterpretq_u16_s16(vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(spu__h(a)), 8), 8))); }
+static inline u128 spu_xshw_nl(u128 a) { return spu__fw(vreinterpretq_u32_s32(vshrq_n_s32(vshlq_n_s32(vreinterpretq_s32_u32(spu__w(a)), 16), 16))); }
+static inline u128 spu_splat_u32_nl(uint32_t v) { return spu__fw(vdupq_n_u32(v)); }
+static inline u128 spu_il_nl(int32_t i)    { return spu__fw(vdupq_n_u32((uint32_t)i)); }
+static inline u128 spu_ila_nl(uint32_t i)  { return spu__fw(vdupq_n_u32(i & 0x3FFFF)); }
+static inline u128 spu_ilh_nl(uint16_t i)  { return spu__fh(vdupq_n_u16(i)); }
+static inline u128 spu_ilhu_nl(uint16_t i) { return spu__fw(vdupq_n_u32((uint32_t)i << 16)); }
+#define spu_a     spu_a_nl
+#define spu_sf    spu_sf_nl
+#define spu_ah    spu_ah_nl
+#define spu_sfh   spu_sfh_nl
+#define spu_ai    spu_ai_nl
+#define spu_ahi   spu_ahi_nl
+#define spu_sfi   spu_sfi_nl
+#define spu_sfhi  spu_sfhi_nl
+#define spu_and   spu_and_nl
+#define spu_or    spu_or_nl
+#define spu_xor   spu_xor_nl
+#define spu_nand  spu_nand_nl
+#define spu_nor   spu_nor_nl
+#define spu_andc  spu_andc_nl
+#define spu_orc   spu_orc_nl
+#define spu_andi  spu_andi_nl
+#define spu_ori   spu_ori_nl
+#define spu_xori  spu_xori_nl
+#define spu_andhi spu_andhi_nl
+#define spu_orhi  spu_orhi_nl
+#define spu_andbi spu_andbi_nl
+#define spu_orbi  spu_orbi_nl
+#define spu_xorbi spu_xorbi_nl
+#define spu_iohl  spu_iohl_nl
+#define spu_ceq   spu_ceq_nl
+#define spu_ceqh  spu_ceqh_nl
+#define spu_ceqb  spu_ceqb_nl
+#define spu_cgt   spu_cgt_nl
+#define spu_cgth  spu_cgth_nl
+#define spu_cgtb  spu_cgtb_nl
+#define spu_clgt  spu_clgt_nl
+#define spu_clgth spu_clgth_nl
+#define spu_clgtb spu_clgtb_nl
+#define spu_ceqi  spu_ceqi_nl
+#define spu_ceqhi spu_ceqhi_nl
+#define spu_ceqbi spu_ceqbi_nl
+#define spu_cgti  spu_cgti_nl
+#define spu_clgti spu_clgti_nl
+#define spu_cgthi spu_cgthi_nl
+#define spu_clgthi spu_clgthi_nl
+#define spu_cgtbi spu_cgtbi_nl
+#define spu_clgtbi spu_clgtbi_nl
+#define spu_selb  spu_selb_nl
+#define spu_xsbh  spu_xsbh_nl
+#define spu_xshw  spu_xshw_nl
+#define spu_il    spu_il_nl
+#define spu_ila   spu_ila_nl
+#define spu_ilh   spu_ilh_nl
+#define spu_ilhu  spu_ilhu_nl
+#endif
+
+/* ---- --fx-blocks: one float range check per straight-line run ----
+ * The lifter (spu_lifter.py _fx_blocks) emits, for a run of pure lines with
+ * several float ops, these _fx forms followed by one spu_fx_bad test; when it
+ * fires, the run's inputs are restored and it runs again as lifted (per-op
+ * checks and fix-ups). So without a fire every op is the value the lifted
+ * line computes, and with one the lifted lines decide.
+ * racacit (v0.19): on upstream's float helpers the "fast path" is the
+ * round-toward-zero form (spu__rz_*: one native op, the range check, the
+ * zero rules); each _fx op computes exactly that and folds the lanes the
+ * plain helper would send to its per-lane fix-up (not ok) into the
+ * accumulator, so with no fire every op equals the plain helper. Outside
+ * the RZ/FZ mode the _fx op is the plain (exact) helper. Compares are the
+ * plain helpers (no fix-up path). */
+#if defined(__ARM_NEON) && !defined(SPU_SCALAR_HELPERS) && !defined(SPU_NO_FX_BLOCKS)
+#define SPU_FX_BLOCKS 1
+typedef uint32x4_t spu_fx_acc;   /* all-ones in a lane some op left to the fix-up */
+typedef uint32x4_t spu_fx_reg;
+SPU__NV_INLINE spu_fx_acc spu_fx_init(void) { return vdupq_n_u32(0); }
+SPU__NV_INLINE spu_fx_reg spu_fx_save(u128 a) { return vld1q_u32(a._u32); }
+SPU__NV_INLINE u128 spu_fx_load(spu_fx_reg v) { u128 r; vst1q_u32(r._u32, v); return r; }
+SPU__NV_INLINE int spu_fx_bad(spu_fx_acc acc) {
+#ifdef SPU_FX_TEST_REDO   /* test builds: every run takes the redo */
+    (void)acc; return 1;
+#endif
+    return vmaxvq_u32(acc) != 0; }
+SPU__NV_INLINE void spu_fx_miss(spu_fx_acc* acc, uint32x4_t ok) { *acc = vornq_u32(*acc, ok); }
+SPU__NV_INLINE u128 spu__fx_fa(spu_fx_acc* acc, u128 a, u128 b, uint32_t negb) {
+    if (!spu__nv_rz()) return spu__nv_fa(a, b, negb);
+    const uint32x4_t x = vld1q_u32(a._u32), y = veorq_u32(vld1q_u32(b._u32), vdupq_n_u32(negb));
+    const float32x4_t s = vaddq_f32(spu__nv_f(x), spu__nv_f(y));
+    spu_fx_miss(acc, spu__nv_inrange(s));
+    return spu__nv_u128(spu__nv_flush(spu__nv_u(s)));
+}
+SPU__NV_INLINE u128 spu_fm_fx(spu_fx_acc* acc, u128 a, u128 b) {
+    if (!spu__nv_rz()) return spu__nv_fm(a, b);
+    const uint32x4_t x = vld1q_u32(a._u32), y = vld1q_u32(b._u32);
+    const uint32x4_t zp = vorrq_u32(spu__nv_z(x), spu__nv_z(y));         /* zero product */
+    const float32x4_t s = vmulq_f32(spu__nv_f(x), spu__nv_f(y));
+    spu_fx_miss(acc, vorrq_u32(spu__nv_inrange(s), zp));
+    return spu__nv_u128(vbicq_u32(spu__nv_flush(spu__nv_u(s)), zp));
+}
+SPU__NV_INLINE u128 spu__fx_fma(spu_fx_acc* acc, u128 a, u128 b, u128 c, uint32_t negp, uint32_t negc) {
+    if (!spu__nv_rz()) return spu__nv_fma(a, b, c, negp, negc);
+    const uint32x4_t xa = vld1q_u32(a._u32), y = vld1q_u32(b._u32), zc = vld1q_u32(c._u32);
+    const uint32x4_t zp = vorrq_u32(spu__nv_z(xa), spu__nv_z(y));        /* zero product */
+    const uint32x4_t zi = vbicq_u32(veorq_u32(zc, vdupq_n_u32(negc)), spu__nv_z(zc));   /* zero: +0 */
+    const uint32x4_t x = veorq_u32(xa, vdupq_n_u32(negp));
+    const float32x4_t s = vfmaq_f32(spu__nv_f(zi), spu__nv_f(x), spu__nv_f(y));
+    spu_fx_miss(acc, vorrq_u32(spu__nv_inrange(s), zp));
+    return spu__nv_u128(vbslq_u32(zp, zi, spu__nv_flush(spu__nv_u(s))));
+}
+SPU__NV_INLINE u128 spu_fa_fx(spu_fx_acc* acc, u128 a, u128 b) { return spu__fx_fa(acc, a, b, 0); }
+SPU__NV_INLINE u128 spu_fs_fx(spu_fx_acc* acc, u128 a, u128 b) { return spu__fx_fa(acc, a, b, 0x80000000u); }
+SPU__NV_INLINE u128 spu_fma_fx(spu_fx_acc* acc, u128 a, u128 b, u128 c)  { return spu__fx_fma(acc, a, b, c, 0, 0); }
+SPU__NV_INLINE u128 spu_fms_fx(spu_fx_acc* acc, u128 a, u128 b, u128 c)  { return spu__fx_fma(acc, a, b, c, 0, 0x80000000u); }
+SPU__NV_INLINE u128 spu_fnms_fx(spu_fx_acc* acc, u128 a, u128 b, u128 c) { return spu__fx_fma(acc, a, b, c, 0x80000000u, 0); }
+SPU__NV_INLINE u128 spu_fceq_fx(spu_fx_acc* acc, u128 a, u128 b) { (void)acc; return spu_fceq(a, b); }
+SPU__NV_INLINE u128 spu_fcgt_fx(spu_fx_acc* acc, u128 a, u128 b) { (void)acc; return spu_fcgt(a, b); }
+#else
+#define SPU_FX_BLOCKS 0
+#endif
+
+/* ---- arm64: the hot helpers as statement expressions (SPU_VEC_MACROS) ----
+ * A u128 (a union whose first member is uint64_t[2]) passed to or returned
+ * from a function is lowered by clang as a pair of 64-bit integers (the
+ * AArch64 ABI coercion), even for an inline helper, and after inlining the
+ * optimizer often keeps it that way: a register moves NEON -> GPR pair ->
+ * NEON (fmov / mov.d / ext) around every helper, and a loop-carried address
+ * register lives in GPR pairs. As statement expressions the operands are
+ * loaded straight into vector registers (vld1q from ctx->gpr) and the result
+ * is one vector store, with no u128 parameter or return in between. Each one
+ * computes exactly what the function of the same name above does on arm64
+ * (checked by the differential test in docs/design/spu-codegen.md); a cold
+ * exact path still calls the function. SPU_NO_VEC_MACROS keeps the
+ * functions. */
+#if defined(__aarch64__) && !defined(SPU_SCALAR_LANES) && !defined(SPU_NO_VEC_MACROS)
+#define SPU_VEC_MACROS 1
+#define SPU__AI static inline __attribute__((always_inline))
+#define spu__W(x) vld1q_u32((x)._u32)
+#define spu__H(x) vld1q_u16((x)._u16)
+#define spu__B(x) vld1q_u8((x)._u8)
+#define spu__F(x) vld1q_f32((x)._f32)
+#define spu__FW(v) ({ u128 _spu_r; vst1q_u32(_spu_r._u32, (v)); _spu_r; })
+#define spu__FH(v) ({ u128 _spu_r; vst1q_u16(_spu_r._u16, (v)); _spu_r; })
+#define spu__FB(v) ({ u128 _spu_r; vst1q_u8(_spu_r._u8, (v)); _spu_r; })
+#define spu__FF(v) ({ u128 _spu_r; vst1q_f32(_spu_r._f32, (v)); _spu_r; })
+/* lane ops (the _nl functions above) */
+#undef spu_a
+#define spu_a(a, b) spu__FW(vaddq_u32(spu__W((a)), spu__W((b))))
+#undef spu_sf
+#define spu_sf(a, b) spu__FW(vsubq_u32(spu__W((b)), spu__W((a))))
+#undef spu_ah
+#define spu_ah(a, b) spu__FH(vaddq_u16(spu__H((a)), spu__H((b))))
+#undef spu_sfh
+#define spu_sfh(a, b) spu__FH(vsubq_u16(spu__H((b)), spu__H((a))))
+#undef spu_ai
+#define spu_ai(a, i) spu__FW(vaddq_u32(spu__W((a)), vdupq_n_u32((uint32_t)((int32_t)(i)))))
+#undef spu_ahi
+#define spu_ahi(a, i) spu__FH(vaddq_u16(spu__H((a)), vdupq_n_u16((uint16_t)((int32_t)(i)))))
+#undef spu_sfi
+#define spu_sfi(a, i) spu__FW(vsubq_u32(vdupq_n_u32((uint32_t)((int32_t)(i))), spu__W((a))))
+#undef spu_sfhi
+#define spu_sfhi(a, i) spu__FH(vsubq_u16(vdupq_n_u16((uint16_t)((int32_t)(i))), spu__H((a))))
+#undef spu_and
+#define spu_and(a, b) spu__FW(vandq_u32(spu__W((a)), spu__W((b))))
+#undef spu_or
+#define spu_or(a, b) spu__FW(vorrq_u32(spu__W((a)), spu__W((b))))
+#undef spu_xor
+#define spu_xor(a, b) spu__FW(veorq_u32(spu__W((a)), spu__W((b))))
+#undef spu_nand
+#define spu_nand(a, b) spu__FW(vmvnq_u32(vandq_u32(spu__W((a)), spu__W((b)))))
+#undef spu_nor
+#define spu_nor(a, b) spu__FW(vmvnq_u32(vorrq_u32(spu__W((a)), spu__W((b)))))
+#undef spu_andc
+#define spu_andc(a, b) spu__FW(vbicq_u32(spu__W((a)), spu__W((b))))
+#undef spu_orc
+#define spu_orc(a, b) spu__FW(vornq_u32(spu__W((a)), spu__W((b))))
+#undef spu_andi
+#define spu_andi(a, i) spu__FW(vandq_u32(spu__W((a)), vdupq_n_u32((uint32_t)((int32_t)(i)))))
+#undef spu_ori
+#define spu_ori(a, i) spu__FW(vorrq_u32(spu__W((a)), vdupq_n_u32((uint32_t)((int32_t)(i)))))
+#undef spu_xori
+#define spu_xori(a, i) spu__FW(veorq_u32(spu__W((a)), vdupq_n_u32((uint32_t)((int32_t)(i)))))
+#undef spu_andhi
+#define spu_andhi(a, i) spu__FH(vandq_u16(spu__H((a)), vdupq_n_u16((uint16_t)((int32_t)(i)))))
+#undef spu_orhi
+#define spu_orhi(a, i) spu__FH(vorrq_u16(spu__H((a)), vdupq_n_u16((uint16_t)((int32_t)(i)))))
+#undef spu_andbi
+#define spu_andbi(a, i) spu__FB(vandq_u8(spu__B((a)), vdupq_n_u8((uint8_t)((int32_t)(i)))))
+#undef spu_orbi
+#define spu_orbi(a, i) spu__FB(vorrq_u8(spu__B((a)), vdupq_n_u8((uint8_t)((int32_t)(i)))))
+#undef spu_xorbi
+#define spu_xorbi(a, i) spu__FB(veorq_u8(spu__B((a)), vdupq_n_u8((uint8_t)((int32_t)(i)))))
+#undef spu_iohl
+#define spu_iohl(a, i) spu__FW(vorrq_u32(spu__W((a)), vdupq_n_u32((uint32_t)((uint16_t)(i)))))
+#undef spu_ceq
+#define spu_ceq(a, b) spu__FW(vceqq_u32(spu__W((a)), spu__W((b))))
+#undef spu_ceqh
+#define spu_ceqh(a, b) spu__FH(vceqq_u16(spu__H((a)), spu__H((b))))
+#undef spu_ceqb
+#define spu_ceqb(a, b) spu__FB(vceqq_u8(spu__B((a)), spu__B((b))))
+#undef spu_cgt
+#define spu_cgt(a, b) spu__FW(vcgtq_s32(vreinterpretq_s32_u32(spu__W((a))), vreinterpretq_s32_u32(spu__W((b)))))
+#undef spu_cgth
+#define spu_cgth(a, b) spu__FH(vcgtq_s16(vreinterpretq_s16_u16(spu__H((a))), vreinterpretq_s16_u16(spu__H((b)))))
+#undef spu_cgtb
+#define spu_cgtb(a, b) spu__FB(vcgtq_s8(vreinterpretq_s8_u8(spu__B((a))), vreinterpretq_s8_u8(spu__B((b)))))
+#undef spu_clgt
+#define spu_clgt(a, b) spu__FW(vcgtq_u32(spu__W((a)), spu__W((b))))
+#undef spu_clgth
+#define spu_clgth(a, b) spu__FH(vcgtq_u16(spu__H((a)), spu__H((b))))
+#undef spu_clgtb
+#define spu_clgtb(a, b) spu__FB(vcgtq_u8(spu__B((a)), spu__B((b))))
+#undef spu_ceqi
+#define spu_ceqi(a, i) spu__FW(vceqq_u32(spu__W((a)), vdupq_n_u32((uint32_t)((int32_t)(i)))))
+#undef spu_ceqhi
+#define spu_ceqhi(a, i) spu__FH(vceqq_u16(spu__H((a)), vdupq_n_u16((uint16_t)((int32_t)(i)))))
+#undef spu_ceqbi
+#define spu_ceqbi(a, i) spu__FB(vceqq_u8(spu__B((a)), vdupq_n_u8((uint8_t)((int32_t)(i)))))
+#undef spu_cgti
+#define spu_cgti(a, i) spu__FW(vcgtq_s32(vreinterpretq_s32_u32(spu__W((a))), vdupq_n_s32(((int32_t)(i)))))
+#undef spu_clgti
+#define spu_clgti(a, i) spu__FW(vcgtq_u32(spu__W((a)), vdupq_n_u32((uint32_t)((int32_t)(i)))))
+#undef spu_cgthi
+#define spu_cgthi(a, i) spu__FH(vcgtq_s16(vreinterpretq_s16_u16(spu__H((a))), vdupq_n_s16((int16_t)((int32_t)(i)))))
+#undef spu_clgthi
+#define spu_clgthi(a, i) spu__FH(vcgtq_u16(spu__H((a)), vdupq_n_u16((uint16_t)((int32_t)(i)))))
+#undef spu_cgtbi
+#define spu_cgtbi(a, i) spu__FB(vcgtq_s8(vreinterpretq_s8_u8(spu__B((a))), vdupq_n_s8((int8_t)((int32_t)(i)))))
+#undef spu_clgtbi
+#define spu_clgtbi(a, i) spu__FB(vcgtq_u8(spu__B((a)), vdupq_n_u8((uint8_t)((int32_t)(i)))))
+#undef spu_selb
+#define spu_selb(a, b, c) spu__FW(vbslq_u32(spu__W((c)), spu__W((b)), spu__W((a))))
+#undef spu_xsbh
+#define spu_xsbh(a) spu__FH(vreinterpretq_u16_s16(vshrq_n_s16(vshlq_n_s16(vreinterpretq_s16_u16(spu__H((a))), 8), 8)))
+#undef spu_xshw
+#define spu_xshw(a) spu__FW(vreinterpretq_u32_s32(vshrq_n_s32(vshlq_n_s32(vreinterpretq_s32_u32(spu__W((a))), 16), 16)))
+#undef spu_il
+#define spu_il(i) spu__FW(vdupq_n_u32((uint32_t)((int32_t)(i))))
+#undef spu_ila
+#define spu_ila(i) spu__FW(vdupq_n_u32(((uint32_t)(i)) & 0x3FFFF))
+#undef spu_ilh
+#define spu_ilh(i) spu__FH(vdupq_n_u16(((uint16_t)(i))))
+#undef spu_ilhu
+#define spu_ilhu(i) spu__FW(vdupq_n_u32((uint32_t)((uint16_t)(i)) << 16))
+/* byte shuffles and the quadword byte rotates/shifts */
+SPU__AI uint8x16_t spu__shufb_v(uint8x16_t A, uint8x16_t B, uint8x16_t C) {
+    const uint8x16x2_t AB = { { A, B } };
+    uint8x16_t r = vqtbl2q_u8(AB, veorq_u8(vandq_u8(C, vdupq_n_u8(0x1F)), vdupq_n_u8(3)));
+    if (__builtin_expect(vmaxvq_u8(C) >= 0x80, 0)) {
+        const uint8x16_t m80 = vtstq_u8(C, vdupq_n_u8(0x80));
+        const uint8x16_t mC0 = vceqq_u8(vandq_u8(C, vdupq_n_u8(0xC0)), vdupq_n_u8(0xC0));
+        const uint8x16_t mE0 = vceqq_u8(vandq_u8(C, vdupq_n_u8(0xE0)), vdupq_n_u8(0xE0));
+        r = vbslq_u8(m80, vbslq_u8(mE0, vdupq_n_u8(0x80), mC0), r);
+    }
+    return r; }
+SPU__AI uint8x16_t spu__shlqby_v(uint8x16_t A, int s)
+{ return s >= 16 ? vdupq_n_u8(0) : vqtbl1q_u8(A, vld1q_u8(spu__shlqby_ctl[s & 15])); }
+SPU__AI uint8x16_t spu__rotqmby_v(uint8x16_t A, int s)
+{ return s >= 16 ? vdupq_n_u8(0) : vqtbl1q_u8(A, vld1q_u8(spu__rotqmby_ctl[s & 15])); }
+#if !defined(SPU_SHUFB_SWAP)
+#define spu_shufb(a, b, c) spu__FB(spu__shufb_v(spu__B(a), spu__B(b), spu__B(c)))
+#endif
+#define spu_rotqbyi(a, sh)  spu__FB(vqtbl1q_u8(spu__B(a), vld1q_u8(spu__rotqby_ctl[(sh) & 15])))
+#define spu_rotqby(a, b)    spu__FB(vqtbl1q_u8(spu__B(a), vld1q_u8(spu__rotqby_ctl[(b)._u32[0] & 0x0F])))
+#define spu_rotqbybi(a, b)  spu__FB(vqtbl1q_u8(spu__B(a), vld1q_u8(spu__rotqby_ctl[((b)._u32[0] >> 3) & 0x0F])))
+#define spu_shlqbyi(a, sh)  spu__FB(spu__shlqby_v(spu__B(a), (int)(sh) & 0x1F))
+#define spu_shlqby(a, b)    spu__FB(spu__shlqby_v(spu__B(a), (int)((b)._u32[0] & 0x1F)))
+#define spu_shlqbybi(a, b)  spu__FB(spu__shlqby_v(spu__B(a), (int)(((b)._u32[0] >> 3) & 0x1F)))
+#define spu_rotqmbyi(a, i7) spu__FB(spu__rotqmby_v(spu__B(a), (0 - (int)(i7)) & 0x1F))
+#define spu_rotqmby(a, b)   spu__FB(spu__rotqmby_v(spu__B(a), (0 - (int)(b)._u32[0]) & 0x1F))
+#define spu_rotqmbybi(a, b) spu__FB(spu__rotqmby_v(spu__B(a), (0 - ((int)(b)._u32[0] >> 3)) & 0x1F))
+/* insertion controls */
+#define spu_cbd(a, i7) spu__FB(vld1q_u8(spu__cbd_ctl[((int)(a)._u32[0] + (int)(i7)) & 0xF]))
+#define spu_chd(a, i7) spu__FB(vld1q_u8(spu__chd_ctl[(((int)(a)._u32[0] + (int)(i7)) & 0xF) >> 1]))
+#define spu_cwd(a, i7) spu__FB(vld1q_u8(spu__cwd_ctl[(((int)(a)._u32[0] + (int)(i7)) & 0xF) >> 2]))
+#define spu_cdd(a, i7) spu__FB(vld1q_u8(spu__cdd_ctl[(((int)(a)._u32[0] + (int)(i7)) & 0xF) >> 3]))
+#define spu_cbx(a, b) spu__FB(vld1q_u8(spu__cbd_ctl[(int)((a)._u32[0] + (b)._u32[0]) & 0xF]))
+#define spu_chx(a, b) spu__FB(vld1q_u8(spu__chd_ctl[((int)((a)._u32[0] + (b)._u32[0]) & 0xF) >> 1]))
+#define spu_cwx(a, b) spu__FB(vld1q_u8(spu__cwd_ctl[((int)((a)._u32[0] + (b)._u32[0]) & 0xF) >> 2]))
+#define spu_cdx(a, b) spu__FB(vld1q_u8(spu__cdd_ctl[((int)((a)._u32[0] + (b)._u32[0]) & 0xF) >> 3]))
+/* word shifts and rotates by immediate */
+SPU__AI uint32x4_t spu__shli_v(uint32x4_t A, int s)
+{ s &= 0x3F; return s > 31 ? vdupq_n_u32(0) : vshlq_u32(A, vdupq_n_s32(s)); }
+SPU__AI uint32x4_t spu__rotmi_v(uint32x4_t A, int i7)
+{ const int s = (0 - i7) & 0x3F; return s > 31 ? vdupq_n_u32(0) : vshlq_u32(A, vdupq_n_s32(-s)); }
+SPU__AI uint32x4_t spu__rotmai_v(uint32x4_t A, int i7)
+{ int s = (0 - i7) & 0x3F; if (s > 31) s = 31;
+  return vreinterpretq_u32_s32(vshlq_s32(vreinterpretq_s32_u32(A), vdupq_n_s32(-s))); }
+SPU__AI uint32x4_t spu__roti_v(uint32x4_t A, int s)
+{ s &= 31; return vorrq_u32(vshlq_u32(A, vdupq_n_s32(s)), vshlq_u32(A, vdupq_n_s32(s - 32))); }
+#define spu_shli(a, sh)   spu__FW(spu__shli_v(spu__W(a), (int)(sh)))
+#define spu_rotmi(a, i7)  spu__FW(spu__rotmi_v(spu__W(a), (int)(i7)))
+#define spu_rotmai(a, i7) spu__FW(spu__rotmai_v(spu__W(a), (int)(i7)))
+#define spu_roti(a, sh)   spu__FW(spu__roti_v(spu__W(a), (int)(sh)))
+/* quadword bit shifts and rotates by 0-7: SPU word 0 is the most significant
+ * word and host lane 0, so each word takes the bits shifted out of its
+ * neighbour (a shift by 32 or more gives 0, which makes 0 need no case) */
+SPU__AI uint32x4_t spu__qrotl_v(uint32x4_t A, int s)
+{ return vorrq_u32(vshlq_u32(A, vdupq_n_s32(s)), vshlq_u32(vextq_u32(A, A, 1), vdupq_n_s32(s - 32))); }
+SPU__AI uint32x4_t spu__qshl_v(uint32x4_t A, int s)
+{ return vorrq_u32(vshlq_u32(A, vdupq_n_s32(s)), vshlq_u32(vextq_u32(A, vdupq_n_u32(0), 1), vdupq_n_s32(s - 32))); }
+SPU__AI uint32x4_t spu__qshr_v(uint32x4_t A, int s)
+{ return vorrq_u32(vshlq_u32(A, vdupq_n_s32(-s)), vshlq_u32(vextq_u32(vdupq_n_u32(0), A, 3), vdupq_n_s32(32 - s))); }
+#define spu_rotqbii(a, sh)  spu__FW(spu__qrotl_v(spu__W(a), (int)(sh) & 7))
+#define spu_rotqbi(a, b)    spu__FW(spu__qrotl_v(spu__W(a), (int)((b)._u32[0] & 7)))
+#define spu_shlqbii(a, sh)  spu__FW(spu__qshl_v(spu__W(a), (int)(sh) & 7))
+#define spu_shlqbi(a, b)    spu__FW(spu__qshl_v(spu__W(a), (int)((b)._u32[0] & 7)))
+#define spu_rotqmbii(a, i7) spu__FW(spu__qshr_v(spu__W(a), (0 - (int)(i7)) & 7))
+#define spu_rotqmbi(a, b)   spu__FW(spu__qshr_v(spu__W(a), (0 - (int)(b)._u32[0]) & 7))
+/* gather bits of words */
+SPU__AI uint32x4_t spu__gb_v(uint32x4_t A)
+{ const int32x4_t sh = { 3, 2, 1, 0 };
+  return vsetq_lane_u32(vaddvq_u32(vshlq_u32(vandq_u32(A, vdupq_n_u32(1)), sh)), vdupq_n_u32(0), 0); }
+#define spu_gb(a) spu__FW(spu__gb_v(spu__W(a)))
+/* 128-bit local-store access, as spu_ls_read128/write128 (spu_context.h) take
+ * it with the diagnostics compiled out */
+#if !SPU_LS_DIAG && SPU_LS_FAST && !defined(SPU_LS_SCALAR) && !SPU_LS_FILL_GUARD
+#define spu_ls_read128(ctx, lsa) \
+    spu__FB(vrev32q_u8(vld1q_u8(&SPU_LS_BASE(ctx)[(uint32_t)(lsa) & (SPU_LS_MASK & ~0xFu)])))
+#define spu_ls_write128(ctx, lsa, val) \
+    vst1q_u8(&SPU_LS_BASE(ctx)[(uint32_t)(lsa) & (SPU_LS_MASK & ~0xFu)], vrev32q_u8(spu__B(val)))
+#endif
+/* lqd / shufb / stqd to one address (the scalar-store idiom, fused by the
+ * lifter's --st-fuse): the bytes stored are rev32(shufb(a, rev32(raw), c)),
+ * which is shufb's table lookup on (rev32(a), raw) with the control's bytes
+ * reversed per word and no index flip (SPU byte P is host byte P ^ 3 on both
+ * sides). So the store reads the local store bytes, looks them up and stores
+ * them, without the two byte reversals on the store-to-load chain of a loop
+ * that keeps inserting into one quadword. Special selectors as shufb. */
+SPU__AI uint8x16_t spu__shufb_st_v(uint8x16_t A, uint8x16_t raw, uint8x16_t C) {
+    const uint8x16_t Cr = vrev32q_u8(C);
+    const uint8x16x2_t AB = { { vrev32q_u8(A), raw } };
+    uint8x16_t r = vqtbl2q_u8(AB, vandq_u8(Cr, vdupq_n_u8(0x1F)));
+    if (__builtin_expect(vmaxvq_u8(Cr) >= 0x80, 0)) {
+        const uint8x16_t m80 = vtstq_u8(Cr, vdupq_n_u8(0x80));
+        const uint8x16_t mC0 = vceqq_u8(vandq_u8(Cr, vdupq_n_u8(0xC0)), vdupq_n_u8(0xC0));
+        const uint8x16_t mE0 = vceqq_u8(vandq_u8(Cr, vdupq_n_u8(0xE0)), vdupq_n_u8(0xE0));
+        r = vbslq_u8(m80, vbslq_u8(mE0, vdupq_n_u8(0x80), mC0), r);
+    }
+    return r; }
+#if !SPU_LS_DIAG && SPU_LS_FAST && !defined(SPU_LS_SCALAR) && !SPU_LS_FILL_GUARD && !defined(SPU_SHUFB_SWAP)
+#define spu_ls_write128_shufb(ctx, lsa, a, c) ({     uint8_t* const _spu_p = &SPU_LS_BASE(ctx)[(uint32_t)(lsa) & (SPU_LS_MASK & ~0xFu)];     vst1q_u8(_spu_p, spu__shufb_st_v(spu__B(a), vld1q_u8(_spu_p), spu__B(c))); })
+#endif
+#endif
+
+/* The fused scalar store, everywhere else: as lifted (store the shufb of
+ * the quadword read back at the same address). */
+#ifndef spu_ls_write128_shufb
+#define spu_ls_write128_shufb(ctx, lsa, a, c)     spu_ls_write128((ctx), (lsa), spu_shufb((a), spu_ls_read128((ctx), (lsa)), (c)))
 #endif
 
 #endif /* SPU_HELPERS_H */
