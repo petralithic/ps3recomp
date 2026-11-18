@@ -14,9 +14,15 @@
  *   Type 3 (call/return): call/return from subroutine
  */
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include "../../runtime/platform/win32_compat.h"
+#endif
 #include "rsx_commands.h"
 #include "ps3emu/milestone.h"   /* ps3_ms -- boot milestone log */
 #include <stdio.h>
+#include <time.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
@@ -399,6 +405,8 @@ static inline void rsx_vp_const_word(rsx_state* state, u32 reg_offset, u32 data)
  * the constant window (a constant run may open with the load slot) are
  * handled here in one call. Returns 0, having done nothing, for any other run
  * and while RSX_TRACE is on. */
+void rsx_stats_add(u32 methods, u32 draws, u32 clears);
+
 int rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
 {
     static int tr = -1;
@@ -410,6 +418,7 @@ int rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
             u32 v; memcpy(&v, src + i * 4, 4);
             rsx_vp_ucode_word(state, __builtin_bswap32(v));
         }
+        rsx_stats_add(count, 0, 0);   /* RACiT: keep the [rsx-stats] method count whole */
         return 1;
     }
     if (method >= NV4097_SET_TRANSFORM_CONSTANT_LOAD &&
@@ -426,19 +435,76 @@ int rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
             u32 v; memcpy(&v, src + i * 4, 4);
             rsx_vp_const_word(state, (method + i * 4 - NV4097_SET_TRANSFORM_CONSTANT) / 4, __builtin_bswap32(v));
         }
+        rsx_stats_add(count - (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD ? 1u : 0u), 0, 0);
         return 1;
     }
     return 0;
 }
 
+/* Running totals, printed as one [rsx-stats] line every 5 s of wall time. The
+ * per-method logs are capped at a handful each, so "how many draws so far" was
+ * unanswerable from the log -- and a capped count reads exactly like a stall. */
+extern u32 cellGcm_flip_request_count(void);
+static volatile unsigned long long s_st_draws, s_st_flips, s_st_clears, s_st_methods;
+static void rsx_stats_tick(void)
+{
+    /* GetTickCount64 is a memory read; time() per 1024 methods was 2% of the
+     * render thread in a draw-heavy level. */
+    static unsigned long long s_t0;
+    if ((s_st_methods & 1023) != 0) return;
+    const unsigned long long now = GetTickCount64() / 1000ull;
+    if (!s_t0) { s_t0 = now; return; }
+    if (now - s_t0 < 5) return;
+    s_t0 = now;
+    extern volatile unsigned long g_eng_tex_uploads, g_eng_tex_upload_bytes;
+    extern unsigned long long ps3_qpc_us(void);
+    fprintf(stderr, "[rsx-stats] methods=%llu draws=%llu flips=%llu gcmflips=%u clears=%llu texups=%lu texMB=%lu us=%llu\n",
+            s_st_methods, s_st_draws, s_st_flips, cellGcm_flip_request_count(), s_st_clears,
+            g_eng_tex_uploads, g_eng_tex_upload_bytes >> 20, ps3_qpc_us());
+}
+
+/* The bookkeeping rsx_process_method does for every method, alone: what a
+ * caller that has no use for the rest of it (the register-file draw engine
+ * keeps its own state) still owes the [rsx-stats] line. */
+void rsx_stats_add(u32 methods, u32 draws, u32 clears)
+{
+    s_st_methods += methods; s_st_draws += draws; s_st_clears += clears;
+    if (((s_st_methods - methods) >> 10) != (s_st_methods >> 10)) {   /* crossed a 1024 boundary */
+        const u64 keep = s_st_methods; s_st_methods &= ~(u64)1023; rsx_stats_tick(); s_st_methods = keep;
+    }
+}
+
+void rsx_stats_count(u32 method)
+{
+    s_st_methods++;
+    if (method == NV4097_DRAW_ARRAYS || method == NV4097_DRAW_INDEX_ARRAY) s_st_draws++;
+    else if (method == NV4097_CLEAR_SURFACE) s_st_clears++;
+    rsx_stats_tick();
+}
+
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
+    s_st_methods++;
+    if (method == NV4097_DRAW_ARRAYS || method == NV4097_DRAW_INDEX_ARRAY) s_st_draws++;
+    else if (method == 0xE920 || method == 0xE924) s_st_flips++;
+    else if (method == NV4097_CLEAR_SURFACE) s_st_clears++;
+    rsx_stats_tick();
     /* RSX_TRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
      * The fixed 250 was spent entirely on boot-time setup, so the methods around
      * the first real draw -- exactly the ones worth seeing -- were never traced. */
     { static int _rt=-1; if(_rt<0){ const char* e=getenv("RSX_TRACE");
         _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
-      if(_rt){ static int _m=0; if(PS3_LOG_FIRST(_m, _rt)) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+      /* RSX_TRACE_SKIP=<n>: start tracing after the first n methods. */
+      static long _skip = -1; if (_skip < 0) { const char* e2 = getenv("RSX_TRACE_SKIP"); _skip = e2 ? atol(e2) : 0; }
+      /* RSX_TRACE_IDLE=1: only trace while recent flips carried no draws
+       * (a movie or a loading screen shown without the 3D pipeline). */
+      static int _idle = -1; if (_idle < 0) _idle = getenv("RSX_TRACE_IDLE") ? 1 : 0;
+      static unsigned long _fl_draws = 0; static int _quiet = 0;
+      if (_idle) {
+          static unsigned long _last_gf = 0; unsigned long gf = (unsigned long)cellGcm_flip_request_count();
+          if (gf != _last_gf) { _last_gf = gf; _quiet = (s_st_draws == _fl_draws) ? _quiet + 1 : 0; _fl_draws = s_st_draws; }
+      }
+      if(_rt && (!_idle || _quiet >= 3)){ static long _all=0; static int _m=0; if (_all++ >= _skip && _m++<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
     /* Vertex-program constants and microcode are most of a frame's method
      * stream (God of War HD: about 140k constant vec4s and 70k microcode
      * headers a second), and their handlers sat behind every check below.
@@ -543,6 +609,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * Apply the same swap the hardware does so the pre-swap cancels out. */
         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
+        { extern void ps3_tl(char ev, u32 a, u32 b); ps3_tl('L', s_sem_off, val); }
         { static u32 seen[64]; static int ns = 0; int k = 0;   /* TEMP: distinct release offsets */
           for (; k < ns; k++) if (seen[k] == s_sem_off) break;
           if (k == ns && ns < 64) { seen[ns++] = s_sem_off;

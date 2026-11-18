@@ -177,6 +177,11 @@ extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until 
 #ifdef __cplusplus
 }
 #endif
+/* racacit: a port that builds its lifted code with PPU_RECOMP_INLINE_VM uses
+ * that inline path below (one const snapshot, ppu_inl_cfg) instead of the
+ * per-function ppu_mm copy; both make the same test and fall back to the
+ * runtime's vm_read* / vm_write* for everything else. */
+#if !defined(PPU_RECOMP_INLINE_VM)
 /* The memory-model globals that are set before any guest code runs, copied
  * into a local. A guest store goes through a byte pointer the compiler cannot
  * tell apart from these globals, so code that reads them directly reloads
@@ -316,6 +321,144 @@ static inline void vm_write64_inl(uint64_t a, uint64_t v) { const ppu_mm m = ppu
 #define vm_write32(a, v) vm_write32_inl(a, v)
 #define vm_write64(a, v) vm_write64_inl(a, v)
 #endif
+#endif /* !PPU_RECOMP_INLINE_VM */
+/* PPU_RECOMP_INLINE_VM (defined for the lifted translation units only): the
+ * ordinary-memory case of every guest load and store inlined into the lifted
+ * code -- the same test the runtime's vm_read* / vm_write* make first, and
+ * those functions for everything else (diagnostics, MMIO windows, the null
+ * page, SPU-reserved lines). A call per access was a fifth of the main
+ * thread's host time. The runtime's own sources include this header too and
+ * keep the plain declarations. */
+#if defined(PPU_RECOMP_INLINE_VM)
+#include <string.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern uint8_t* vm_base;
+extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until the first */
+/* The fast-path gate as one snapshot, filled by ppu_run (ppu_inl_cfg_refresh)
+ * before any guest code and constant from then on -- so declared const here:
+ * the compiler keeps it in registers instead of reloading vm_base, g_vm_diag,
+ * ppu_hle_inject_base and ppu_vm_size (each through an import stub) after
+ * every guest store. Ordinary memory is [lo, lo + span) less the GCM control
+ * page at `hole`; span 0 (diagnostics on, or not filled yet) sends every
+ * access to the runtime's vm_read* / vm_write*. Same test as before. */
+typedef struct { uint8_t* base; uint64_t span; uint32_t lo, hole; } ppu_inl_cfg_t;
+extern const ppu_inl_cfg_t ppu_inl_cfg;
+#ifdef __cplusplus
+}
+#endif
+static inline int ppu_inl_ok(uint32_t ea, uint32_t n)
+{
+    if ((uint64_t)(uint32_t)(ea - ppu_inl_cfg.lo) + n > ppu_inl_cfg.span) return 0;
+#if !defined(PPU_INL_NO_HOLE)   /* a port whose ppu_run clips the window at the hole (ppu_inl_clip_hole) */
+    if ((uint32_t)(ea - ppu_inl_cfg.hole) < 0x1000u) return 0;
+#endif
+    return 1;
+}
+static inline int ppu_inl_wok(uint32_t ea, uint32_t n)
+{
+    if (!ppu_inl_ok(ea, n)) return 0;
+    const unsigned char* bits = g_spu_coh_bits;
+    if (!bits) return 1;
+    const uint32_t l = ea >> 7;
+    return !((bits[l >> 3] >> (l & 7)) & 1u);
+}
+/* Guest loads and stores are volatile: other threads (SPUs, the RSX, other
+ * PPU threads) write this memory, and with the gate constant the compiler
+ * would otherwise be free to keep a polled value in a register or reorder
+ * guest stores between barriers -- the old per-access reload of vm_base
+ * had kept them in program order by accident. Measured: same code size. */
+typedef uint16_t __attribute__((aligned(1))) ppu_vu16;
+typedef uint32_t __attribute__((aligned(1))) ppu_vu32;
+typedef uint64_t __attribute__((aligned(1))) ppu_vu64;
+static inline uint8_t ppu_inl_read8(uint64_t a)
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 1), 1)) return *(volatile uint8_t*)(ppu_inl_cfg.base + e); return vm_read8(a); }
+static inline uint16_t ppu_inl_read16(uint64_t a)
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 2), 1)) { uint16_t v = *(volatile ppu_vu16*)(ppu_inl_cfg.base + e); return __builtin_bswap16(v); } return vm_read16(a); }
+static inline uint32_t ppu_inl_read32(uint64_t a)
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 4), 1)) { uint32_t v = *(volatile ppu_vu32*)(ppu_inl_cfg.base + e); return __builtin_bswap32(v); } return vm_read32(a); }
+static inline uint64_t ppu_inl_read64(uint64_t a)
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_ok(e, 8), 1)) { uint64_t v = *(volatile ppu_vu64*)(ppu_inl_cfg.base + e); return __builtin_bswap64(v); } return vm_read64(a); }
+static inline void ppu_inl_write8(uint64_t a, uint8_t v)
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 1), 1)) { *(volatile uint8_t*)(ppu_inl_cfg.base + e) = v; return; } vm_write8(a, v); }
+static inline void ppu_inl_write16(uint64_t a, uint16_t v)
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 2), 1)) { const uint16_t s = __builtin_bswap16(v); *(volatile ppu_vu16*)(ppu_inl_cfg.base + e) = s; return; } vm_write16(a, v); }
+static inline void ppu_inl_write32(uint64_t a, uint32_t v)
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 4), 1)) { const uint32_t s = __builtin_bswap32(v); *(volatile ppu_vu32*)(ppu_inl_cfg.base + e) = s; return; } vm_write32(a, v); }
+static inline void ppu_inl_write64(uint64_t a, uint64_t v)
+{ const uint32_t e = (uint32_t)a; if (__builtin_expect(ppu_inl_wok(e, 8), 1)) { const uint64_t s = __builtin_bswap64(v); *(volatile ppu_vu64*)(ppu_inl_cfg.base + e) = s; return; } vm_write64(a, v); }
+#define vm_read8   ppu_inl_read8
+#define vm_read16  ppu_inl_read16
+#define vm_read32  ppu_inl_read32
+#define vm_read64  ppu_inl_read64
+#define vm_write8  ppu_inl_write8
+#define vm_write16 ppu_inl_write16
+#define vm_write32 ppu_inl_write32
+#define vm_write64 ppu_inl_write64
+#endif /* PPU_RECOMP_INLINE_VM */
+/* Vector, byte-reversed and dcbz guest accesses (lvx/stvx, lve*x/stve*x,
+ * lwbrx/stwbrx/..., dcbz): straight to vm_base as before, but volatile, and a
+ * store into a 128-byte line an SPU has reserved goes through the runtime
+ * (ppu_vst_coh: the lock-line lock and the SPU's lost-reservation notify) like
+ * every scalar store already did. A raw stvx landing inside an SPU's PUTLLC
+ * lost the PPU's bits: A Crack in Time's job submit ORs its ready bits into a
+ * table with lvx/vor/stvx, and the job manager took them with GETLLAR/PUTLLC
+ * -- a job that never ran, the main thread waiting forever for its record
+ * (level 14, 2026-10-19). */
+#include <string.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern uint8_t* vm_base;
+extern const unsigned char* g_spu_coh_bits;   /* SPU-reserved lines, NULL until the first */
+void ppu_vst_coh(uint32_t ea, const void* src, uint32_t n);   /* ppu_loader.cpp */
+#ifdef __cplusplus
+}
+#endif
+typedef uint16_t __attribute__((aligned(1))) ppu_raw16;
+typedef uint32_t __attribute__((aligned(1))) ppu_raw32;
+typedef uint64_t __attribute__((aligned(1))) ppu_raw64;
+static inline void ppu_vld(void* dst, uint32_t ea, uint32_t n)
+{
+    const volatile uint8_t* s = (const volatile uint8_t*)(vm_base + ea);
+    switch (n) {
+    case 16: { const uint64_t a = *(const volatile ppu_raw64*)s, b = *(const volatile ppu_raw64*)(s + 8);
+               memcpy(dst, &a, 8); memcpy((uint8_t*)dst + 8, &b, 8); return; }
+    case 8:  { const uint64_t a = *(const volatile ppu_raw64*)s; memcpy(dst, &a, 8); return; }
+    case 4:  { const uint32_t a = *(const volatile ppu_raw32*)s; memcpy(dst, &a, 4); return; }
+    case 2:  { const uint16_t a = *(const volatile ppu_raw16*)s; memcpy(dst, &a, 2); return; }
+    default: for (uint32_t i = 0; i < n; i++) ((uint8_t*)dst)[i] = s[i]; return;
+    }
+}
+static inline int ppu_line_reserved(uint32_t ea)
+{
+    const unsigned char* bits = g_spu_coh_bits;
+    if (!bits) return 0;
+    const uint32_t l = ea >> 7;
+    return (bits[l >> 3] >> (l & 7)) & 1u;
+}
+static inline void ppu_vst(uint32_t ea, const void* src, uint32_t n)
+{
+    if (__builtin_expect(ppu_line_reserved(ea), 0)) { ppu_vst_coh(ea, src, n); return; }
+    volatile uint8_t* d = (volatile uint8_t*)(vm_base + ea);
+    switch (n) {
+    case 16: { uint64_t a, b; memcpy(&a, src, 8); memcpy(&b, (const uint8_t*)src + 8, 8);
+               *(volatile ppu_raw64*)d = a; *(volatile ppu_raw64*)(d + 8) = b; return; }
+    case 8:  { uint64_t a; memcpy(&a, src, 8); *(volatile ppu_raw64*)d = a; return; }
+    case 4:  { uint32_t a; memcpy(&a, src, 4); *(volatile ppu_raw32*)d = a; return; }
+    case 2:  { uint16_t a; memcpy(&a, src, 2); *(volatile ppu_raw16*)d = a; return; }
+    default: for (uint32_t i = 0; i < n; i++) d[i] = ((const uint8_t*)src)[i]; return;
+    }
+}
+static inline void ppu_vzero(uint32_t ea, uint32_t n)   /* dcbz: one 128-byte line */
+{
+    static const uint8_t z[128] = {0};
+    if (__builtin_expect(ppu_line_reserved(ea), 0)) { ppu_vst_coh(ea, z, n); return; }
+    volatile uint8_t* d = (volatile uint8_t*)(vm_base + ea);
+    for (uint32_t i = 0; i < n; i += 8) *(volatile ppu_raw64*)(d + i) = 0;
+}
+
 
 /* Syscall handler */
 #ifdef __cplusplus
@@ -603,7 +746,11 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 } while(0)
 
 /* Each lifted function opens with PPU_MM_SNAP; its loads and stores use that
- * copy of the memory model (ppu_mm in ppu_recomp.h). */
+ * copy of the memory model (ppu_mm in ppu_recomp.h). With PPU_RECOMP_INLINE_VM
+ * the lifted code uses ppu_inl_cfg instead, and PPU_MM_SNAP is empty. */
+#if defined(PPU_RECOMP_INLINE_VM)
+#define PPU_MM_SNAP
+#else
 #define PPU_MM_SNAP const ppu_mm _mm = ppu_mm_take(); (void)_mm;
 #ifndef PPU_NO_INLINE_LOADS
 #undef vm_read8
@@ -625,6 +772,7 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 #define vm_write32(a, v) vm_write32_mm(&_mm, a, v)
 #define vm_write64(a, v) vm_write64_mm(&_mm, a, v)
 #endif
+#endif /* PPU_RECOMP_INLINE_VM */
 
 """
 
@@ -1531,7 +1679,9 @@ class PPULifter:
                 f"  /* insn patch 0x{insn.addr:08X}: {orig:08X} -> {new:08X} */")
 
     def _translate(self, insn: Instruction, func: LiftedFunction) -> str:
-        code = self._oe_wrap(insn, self._translate_xo_base(insn, func))
+        code = self._translate_vmx_aliased(insn, func)
+        if code is None:
+            code = self._oe_wrap(insn, self._translate_xo_base(insn, func))
         mn = insn.mnemonic
         if (mn.endswith(".") and code and not code.startswith("/*")
                 and mn not in self._CR0_SELF_HANDLED
@@ -1549,6 +1699,42 @@ class PPULifter:
                 and code and not code.startswith("/*")):
             code += " ctx->cr = (ctx->cr & ~0x0F000000u) | ((ctx->fpscr >> 4) & 0x0F000000u);"
         return code
+
+    # A vector instruction whose destination is also one of its sources
+    # (`vcmpequh. v0, v1, v0`, `vmrghh v3, v3, v4`, ...). The lowerings below
+    # write vD lane by lane through a pointer into ctx->vr, so a source that
+    # IS vD is read back after some of its lanes were already overwritten.
+    # The hardware reads every source before writing the result. vcmpequh.
+    # was the case that showed it: `d[i] = a[i]==b[i] ? ~0 : 0; t += a[i]==b[i]`
+    # re-read b[i] after storing the mask into it, so a lane that matched
+    # never counted and CR6 said "no lane equal" -- the vectorised u16 search
+    # in A Crack in Time's texture streamer (func_005E3584) never found a key
+    # other than 0, high-resolution textures were never switched in, and VRAM
+    # compaction then drew low-resolution headers over high-resolution data
+    # (the striped textures). Here such an instruction is lowered with the
+    # aliased source renamed to a snapshot taken before it runs.
+    _VMX_SNAPSHOT_REG = 99
+
+    def _translate_vmx_aliased(self, insn: Instruction, func: LiftedFunction):
+        mn = insn.mnemonic
+        if not mn.startswith("v"):
+            return None
+        ops = _parse_operands(insn.operands)
+        if len(ops) < 2 or not re.fullmatch(r"v\d+", ops[0] or ""):
+            return None
+        vd = ops[0]
+        if not any(o == vd for o in ops[1:]):
+            return None
+        snap = f"v{self._VMX_SNAPSHOT_REG}"
+        alias = Instruction(insn.addr, insn.raw, mn, ", ".join([vd] + [snap if o == vd else o for o in ops[1:]]),
+                            insn.comment)
+        code = self._translate_op(alias, func)
+        tag = f"ctx->vr[{self._VMX_SNAPSHOT_REG}]"
+        if not code or tag not in code or code.startswith("/*"):
+            return None                   # not a lowering that reads it as a register
+        n = int(vd[1:])
+        return (f"{{ alignas(16) uint8_t _vsnap[16]; memcpy(_vsnap, &ctx->vr[{n}], 16); "
+                + code.replace(tag, "_vsnap") + " }")
 
     def _translate_op(self, insn: Instruction, func: LiftedFunction) -> str:
         """Translate one Instruction to a C statement string."""
@@ -2778,7 +2964,7 @@ class PPULifter:
         if mn == "stdbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra, rb)}; uint64_t raw = ctx->gpr[{rs}]; "
-                    f"VM_RAW_ST(uint64_t, ea, raw); }}")   # host LE = byte-reversed
+                    f"ppu_vst((uint32_t)ea, &raw, 8); }}")   # host LE = byte-reversed
 
         # ------- String word load/store -------
         # NB bytes (lswi: NB field, 0 = 32; lswx: XER[25:31]) move between memory
@@ -2808,19 +2994,19 @@ class PPULifter:
         if mn == "lwbrx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint32_t raw = VM_RAW_LD(uint32_t, ea); "
+                    f"uint32_t raw; ppu_vld(&raw, (uint32_t)ea, 4); "
                     f"ctx->gpr[{rd}] = raw; }}") # NOTE: no bswap — reads in host (LE) order
 
         if mn == "stwbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint32_t raw = (uint32_t)ctx->gpr[{rs}]; "
-                    f"VM_RAW_ST(uint32_t, ea, raw); }}")
+                    f"ppu_vst((uint32_t)ea, &raw, 4); }}")
 
         if mn == "lhbrx":
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint16_t raw = VM_RAW_LD(uint16_t, ea); "
+                    f"uint16_t raw; ppu_vld(&raw, (uint32_t)ea, 2); "
                     f"ctx->gpr[{rd}] = raw; }}")
 
         if mn == "ldbrx":
@@ -2829,14 +3015,14 @@ class PPULifter:
             # as lhbrx above.
             rd, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
-                    f"uint64_t raw = VM_RAW_LD(uint64_t, ea); "
+                    f"uint64_t raw; ppu_vld(&raw, (uint32_t)ea, 8); "
                     f"ctx->gpr[{rd}] = raw; }}")
 
         if mn == "sthbrx":
             rs, ra, rb = _reg_idx(ops[0]), _reg_idx(ops[1]), _reg_idx(ops[2])
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"uint16_t raw = (uint16_t)ctx->gpr[{rs}]; "
-                    f"VM_RAW_ST(uint16_t, ea, raw); }}")
+                    f"ppu_vst((uint32_t)ea, &raw, 2); }}")
 
         # ------- Load algebraic -------
         if mn == "lwax":
@@ -2873,7 +3059,7 @@ class PPULifter:
             ra = _reg_idx(ops[0])
             rb = _reg_idx(ops[1])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0x7FULL; "
-                    f"memset(vm_base + (uint32_t)ea, 0, 128); }}")
+                    f"ppu_vzero((uint32_t)ea, 128); }}")
 
         if mn in ("dcbt", "dcbtst", "dcbf", "dcbst", "dcba", "icbi"):
             return f"/* {mn}: cache hint, no-op */;"
@@ -2964,14 +3150,14 @@ class PPULifter:
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
-                    f"vm_raw_ld16(&ctx->vr[{vd}], ea); }}")
+                    f"ppu_vld(&ctx->vr[{vd}], (uint32_t)ea, 16); }}")
 
         if mn in ("stvx", "stvxl"):
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
             ra = _reg_idx(ops[1])
             rb = _reg_idx(ops[2])
             return (f"{{ uint64_t ea = ({_xea(ra,rb)}) & ~0xFULL; "
-                    f"vm_raw_st16(ea, &ctx->vr[{vs}]); }}")
+                    f"ppu_vst((uint32_t)ea, &ctx->vr[{vs}], 16); }}")
 
         # Cell unaligned vector loads (CBEA / AltiVec): lvlx loads bytes
         # [EA&15 .. 15] of the aligned quadword left-justified into vD and
@@ -3009,8 +3195,8 @@ class PPULifter:
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"ea &= ~{size - 1}ULL; "
                     f"memset(&ctx->vr[{vd}], 0, 16); "
-                    f"{{ uint{size*8}_t _e = VM_RAW_LD(uint{size*8}_t, ea); "
-                    f"memcpy((uint8_t*)&ctx->vr[{vd}] + (ea & 15), &_e, {size}); }} }}")
+                    f"ppu_vld((uint8_t*)&ctx->vr[{vd}] + (ea & 15), "
+                    f"(uint32_t)ea, {size}); }}")
 
         if mn == "stvebx" or mn == "stvehx" or mn == "stvewx":
             vs = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -3019,8 +3205,8 @@ class PPULifter:
             size = {"stvebx": 1, "stvehx": 2, "stvewx": 4}[mn]
             return (f"{{ uint64_t ea = {_xea(ra,rb)}; "
                     f"ea &= ~{size - 1}ULL; "
-                    f"{{ uint{size*8}_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); "
-                    f"VM_RAW_ST(uint{size*8}_t, ea, _e); }} }}")
+                    f"ppu_vst((uint32_t)ea, "
+                    f"(const uint8_t*)&ctx->vr[{vs}] + (ea & 15), {size}); }}")
 
         if mn == "lvsl" or mn == "lvsr":
             vd = int(ops[0][1:]) if ops[0].startswith("v") else _reg_idx(ops[0])
@@ -3251,7 +3437,7 @@ class PPULifter:
             # stale, so the `b[n]e cr6` after it followed an older compare.
             return (f"{{ uint16_t* a=(uint16_t*)&ctx->vr[{va}]; uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
                     f"uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; int t=0; "
-                    f"for(int i=0;i<8;i++){{ d[i]=a[i]==b[i]?(uint16_t)~0:0; t+=a[i]==b[i]; }}"
+                    f"for(int i=0;i<8;i++){{ int r=a[i]==b[i]; d[i]=r?(uint16_t)~0:0; t+=r; }}"
                     + (" uint32_t c6=(t==8?8u:0u)|(t==0?2u:0u); "
                        "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);" if mn.endswith(".") else "")
                     + " }")
@@ -3518,7 +3704,7 @@ class PPULifter:
             # Dot form: CR6 as for vcmpequh. above (8 = all lanes equal, 2 = none).
             return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint8_t* a=(uint8_t*)&ctx->vr[{va}]; "
                     f"uint8_t* b=(uint8_t*)&ctx->vr[{vb}]; int t=0; "
-                    f"for(int i=0;i<16;i++){{ d[i]=a[i]==b[i]?0xFFu:0u; t+=a[i]==b[i]; }}"
+                    f"for(int i=0;i<16;i++){{ int r=a[i]==b[i]; d[i]=r?0xFFu:0u; t+=r; }}"
                     + (" uint32_t c6=(t==16?8u:0u)|(t==0?2u:0u); "
                        "ctx->cr=(ctx->cr & ~(0xFu<<4))|(c6<<4);" if mn.endswith(".") else "")
                     + " }")
@@ -3764,19 +3950,27 @@ class PPULifter:
         # them as a TODO comment left the narrow step out entirely, so the
         # destination register kept whatever it held.
         if mn == "vpkuhus":
+            # Big-endian halfword lanes composed from their bytes: read through
+            # a host uint16_t* nearly every value looked > 255 and saturated.
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint8_t* d=(uint8_t*)&ctx->vr[{vd}]; uint16_t* a=(uint16_t*)&ctx->vr[{va}]; "
-                    f"uint16_t* b=(uint16_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<8;i++){{uint32_t v=a[i]; d[i]=(uint8_t)(v>255u?255u:v);}} "
-                    f"for(int i=0;i<8;i++){{uint32_t v=b[i]; d[8+i]=(uint8_t)(v>255u?255u:v);}} }}")
+            return (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                    f"const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; uint8_t o[16]; "
+                    f"for(int i=0;i<8;i++){{ uint32_t v=(uint32_t)((a[2*i]<<8)|a[2*i+1]); o[i]=(uint8_t)(v>255u?255u:v); }} "
+                    f"for(int i=0;i<8;i++){{ uint32_t v=(uint32_t)((b[2*i]<<8)|b[2*i+1]); o[8+i]=(uint8_t)(v>255u?255u:v); }} "
+                    f"memcpy(&ctx->vr[{vd}], o, 16); }}")
 
         # Pack unsigned word -> unsigned halfword, saturating (vpkuwus)
         if mn == "vpkuwus":
+            # Big-endian lanes, as for vpkuhus: a host uint32_t* read saturated
+            # almost every word to 0xFFFF and wrote it byte-reversed.
             vd, va, vb = int(ops[0][1:]), int(ops[1][1:]), int(ops[2][1:])
-            return (f"{{ uint16_t* d=(uint16_t*)&ctx->vr[{vd}]; uint32_t* a=(uint32_t*)&ctx->vr[{va}]; "
-                    f"uint32_t* b=(uint32_t*)&ctx->vr[{vb}]; "
-                    f"for(int i=0;i<4;i++){{uint32_t v=a[i]; d[i]=(uint16_t)(v>65535u?65535u:v);}} "
-                    f"for(int i=0;i<4;i++){{uint32_t v=b[i]; d[4+i]=(uint16_t)(v>65535u?65535u:v);}} }}")
+            return (f"{{ const uint8_t* a=(const uint8_t*)&ctx->vr[{va}]; "
+                    f"const uint8_t* b=(const uint8_t*)&ctx->vr[{vb}]; uint8_t o[16]; "
+                    f"for(int i=0;i<4;i++){{ uint32_t v=((uint32_t)a[4*i]<<24)|((uint32_t)a[4*i+1]<<16)|((uint32_t)a[4*i+2]<<8)|a[4*i+3]; "
+                    f"uint32_t r=v>65535u?65535u:v; o[2*i]=(uint8_t)(r>>8); o[2*i+1]=(uint8_t)r; }} "
+                    f"for(int i=0;i<4;i++){{ uint32_t v=((uint32_t)b[4*i]<<24)|((uint32_t)b[4*i+1]<<16)|((uint32_t)b[4*i+2]<<8)|b[4*i+3]; "
+                    f"uint32_t r=v>65535u?65535u:v; o[8+2*i]=(uint8_t)(r>>8); o[8+2*i+1]=(uint8_t)r; }} "
+                    f"memcpy(&ctx->vr[{vd}], o, 16); }}")
 
         # vmsummbm (VA-form, 4 operands)
         if mn == "vmsummbm":
@@ -4292,6 +4486,10 @@ class PPULifter:
 
         preamble = self._preamble_lines()
         written: list[str] = []
+        # PORT PATCH (racacit): PS3RECOMP_CHUNK_LINES overrides the chunk size.
+        # 600k-line units need >5 GB to compile; smaller ones build on phones'
+        # toolchains and memory-limited hosts.
+        max_lines = int(os.environ.get("PS3RECOMP_CHUNK_LINES", max_lines))
         chunk_idx = 0
         changed = 0
 
@@ -4721,6 +4919,17 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                             b = [x.strip() for x in w2.operands.split(',')]
                             if not b or b[0] != _mid or w2.mnemonic.startswith(('st', 'lf')):
                                 continue        # stores (std r30,..(r1)) read, not define
+                            # A reload from a stack slot is a callee-saved restore
+                            # on an exit path, not the base: an early tail-call exit
+                            # (`ld r30,0xB0(r1); ...; b func`) does not end in blr, so
+                            # _live keeps it, and taking it as the nearest definition
+                            # dropped the switch. (RaCACiT func_001709B4: r30 loaded
+                            # from the TOC in the prologue; both of its switches lifted
+                            # to unresolved bctrs, the second at 0x170DD4 hit the
+                            # stuck-call abort a few minutes into play.)
+                            if (w2.mnemonic in ('lwz', 'ld') and len(b) == 2
+                                    and b[1].replace(' ', '').endswith('(r1)')):
+                                continue
                             if w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1]:
                                 disp = mem_disp(b[1]); r_base = cand
                                 base_is_ld = (w2.mnemonic == 'ld')

@@ -94,45 +94,6 @@ static LwCondSlot s_lwcond[MAX_LWCOND];
 static u32 s_lwcond_next = 0;
 
 /* ---------------------------------------------------------------------------
- * Internal: Thread table
- * -----------------------------------------------------------------------*/
-#define MAX_PRX_THREADS 64
-
-typedef struct {
-    int in_use;
-    u64 thread_id;
-    sys_ppu_thread_entry_t entry;
-    u64 arg;
-    u64 exitcode;
-    int joined;
-    int detached;
-#ifdef _WIN32
-    HANDLE handle;
-#else
-    pthread_t pt;
-#endif
-} PrxThreadSlot;
-
-static PrxThreadSlot s_threads[MAX_PRX_THREADS];
-static u64 s_next_thread_id = 0x10000; /* start high to avoid collision with sys_ppu_thread */
-
-#ifdef _WIN32
-static DWORD WINAPI prx_thread_entry(LPVOID param)
-{
-    PrxThreadSlot* t = (PrxThreadSlot*)param;
-    t->entry(t->arg);
-    return 0;
-}
-#else
-static void* prx_thread_entry(void* param)
-{
-    PrxThreadSlot* t = (PrxThreadSlot*)param;
-    t->entry(t->arg);
-    return NULL;
-}
-#endif
-
-/* ---------------------------------------------------------------------------
  * Internal: Heap table
  * -----------------------------------------------------------------------*/
 #define MAX_HEAPS 16

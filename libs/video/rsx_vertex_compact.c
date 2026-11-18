@@ -143,9 +143,20 @@ void rsx_vertex_fetch_plan_init(
         rsx_dsp_get_vertex_attr(rsx, attr, &fetch->desc);
         fetch->elem_size =
             rsx_vertex_attrib_size(fetch->desc.type, fetch->desc.size);
-        fetch->stride =
-            fetch->desc.stride ? fetch->desc.stride : fetch->elem_size;
+        /* Stride 0 is not "tightly packed": every vertex reads the SAME
+         * element, a per-draw constant. A Crack in Time draws each particle
+         * as a quad whose centre, size and colour are stride-0 attributes;
+         * reading consecutive elements gave three of the four corners the
+         * memory after it, and fire, projectiles and sparks drew nothing. */
+        fetch->stride = fetch->desc.stride;
         rsx_vertex_fetch_default(rsx, attr, fetch->default_value);
+        /* RSX_STRIDE0=reg (experiment): a stride-0 array reads the
+         * attribute's VERTEX_DATA register instead of memory. */
+        { static int s0 = -1;
+          if (s0 < 0) { const char* e = getenv("RSX_STRIDE0"); s0 = (e && !strcmp(e, "reg")) ? 1 : 0; }
+          if (s0 && !fetch->desc.stride && fetch->desc.type && fetch->desc.size) {
+              fetch->desc.type = 0; fetch->desc.size = 0; fetch->elem_size = 0;
+          } }
     }
 }
 
@@ -209,7 +220,8 @@ void rsx_vertex_fetch_plan_prepare(
          * the right base. */
         if (plan->inline_data) {
             const u32 stride =
-                plan->inline_stride ? plan->inline_stride : fetch->stride;
+                plan->inline_stride ? plan->inline_stride
+                : (fetch->stride ? fetch->stride : fetch->elem_size);
             const u32 off = plan->inline_off[attr];
             if (!stride || off + fetch->elem_size > stride)
                 continue;
@@ -461,6 +473,49 @@ int rsx_vertex_remap_build(
     }
 
     u32 unique = 0;
+
+    /* One base index and a compact id range (an ordinary indexed mesh): a
+     * table indexed by the id itself, no hashing or probing. Same first-use
+     * numbering as the hash path below. */
+    {
+        u32 lo = refs[0].vertex_id, hi = lo, same_base = 1;
+        const u32 b0 = refs[0].base_index;
+        for (u32 i = 1; i < count; i++) {
+            const u32 v = refs[i].vertex_id;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+            same_base &= refs[i].base_index == b0;
+        }
+        const u64 range = (u64)hi - lo + 1u;
+        if (same_base && range <= (u64)count * 4u + 4096u) {
+            if (range > remap->direct_capacity) {
+                u64* d = (u64*)realloc(remap->direct, (size_t)range * sizeof(u64));
+                if (!d) goto hashed;
+                memset(d + remap->direct_capacity, 0,
+                       (size_t)(range - remap->direct_capacity) * sizeof(u64));
+                remap->direct = d;
+                remap->direct_capacity = (u32)range;
+            }
+            if (remap->generation == 1u)       /* the slots were just cleared: so is this */
+                memset(remap->direct, 0, (size_t)remap->direct_capacity * sizeof(u64));
+            const u64 gen = (u64)remap->generation << 32;
+            for (u32 occurrence = 0; occurrence < count; occurrence++) {
+                const rsx_vertex_ref ref = refs[occurrence];
+                u64* d = &remap->direct[ref.vertex_id - lo];
+                if ((*d & 0xFFFFFFFF00000000ull) != gen) {
+                    *d = gen | unique;
+                    refs[unique] = ref;
+                    remap->occurrence_to_unique[occurrence] = unique;
+                    unique++;
+                } else {
+                    remap->occurrence_to_unique[occurrence] = (u32)*d;
+                }
+            }
+            *unique_count = unique;
+            return 1;
+        }
+    }
+hashed:;
     const u32 mask = remap->slot_capacity - 1u;
     for (u32 occurrence = 0; occurrence < count; occurrence++) {
         const rsx_vertex_ref ref = refs[occurrence];
@@ -501,6 +556,7 @@ void rsx_vertex_remap_destroy(rsx_vertex_remap* remap)
         return;
     free(remap->occurrence_to_unique);
     free(remap->slots);
+    free(remap->direct);
     memset(remap, 0, sizeof(*remap));
 }
 

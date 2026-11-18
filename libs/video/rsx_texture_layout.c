@@ -367,13 +367,25 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
      * (RPCS3 VKFormats.cpp get_component_mapping: R,R,R,R): a retail title
      * reads its DEPTH16 shadow maps through crossbar 0xA900, R, G and B from A,
      * which through lanes_argb was the resource's opaque alpha -- every
-     * shadow compare saw depth 1.0. */
+     * shadow compare saw depth 1.0.
+     *
+     * racacit: G8B8 is a big-endian 16-bit texel, G in the high byte: memory
+     * byte 0 is G, byte 1 is B, and the texel reaches the resource unswapped
+     * as R = byte 0, G = byte 1. The sampler presents {A,R,G,B} = {G,B,G,B}
+     * (RPCS3: 16-bit word swap + {G,R,G,R}, the same thing). The old
+     * {1,0,1,0} had the two channels the wrong way round: A Crack in Time's
+     * fur shells (Ratchet's ears) sample their noise with remap AAFE -- alpha
+     * from G, colour from B -- and got the density as colour and the colour
+     * channel as alpha: black fur layers blended over the ears.
+     * RSX_TEX_G8B8_OLD=1 restores the old order. */
     static const u8 lanes_argb[4]  = {3, 0, 1, 2};
-    static const u8 lanes_g8b8[4]  = {1, 0, 1, 0};
+    static const u8 lanes_g8b8[4]  = {0, 1, 0, 1};
+    static const u8 lanes_g8b8_old[4] = {1, 0, 1, 0};
     static const u8 lanes_b8[4]    = {RSX_REMAP_ONE, 0, 0, 0};
     static const u8 lanes_depth[4] = {0, 0, 0, 0};
+    static int old = -1; if (old < 0) { const char* e = getenv("RSX_TEX_G8B8_OLD"); old = e && *e == '1'; }
     const u32 base = rsx_fmt & 0x9Fu;
-    const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
+    const u8* src2res = (base == 0x8Bu) ? (old ? lanes_g8b8_old : lanes_g8b8)
                       : (base == 0x81u || base == 0x94u) ? lanes_b8
                       : (base >= 0x90u && base <= 0x93u) ? lanes_depth : lanes_argb;
 

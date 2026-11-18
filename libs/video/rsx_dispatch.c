@@ -178,6 +178,12 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * a title that turned clipping off. */
     rsx->regs[0x1D78 >> 2] = 0x00000001u;
 
+    /* NV40 reset ALPHA_FUNC is ALWAYS (RPCS3 rsx_methods.cpp seeds
+     * CELL_GCM_ALWAYS): a never-written register passes every pixel, and a
+     * game-written 0 -- NEVER in the RSX's short encoding -- stays told
+     * apart from it. */
+    rsx->regs[M_ALPHA_FUNC_FUNC >> 2] = 0x0207u;
+
     /* Execution methods */
     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
@@ -257,6 +263,7 @@ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, 
     if (count > max_words)
         count = max_words;
     memcpy(rsx->constants, words, count * sizeof(u32));
+    rsx->const_dirty_lo = 0; rsx->const_dirty_hi = RSX_DSP_NUM_CONSTANTS;
 }
 
 /* Every NV4097_SET_VERTEX_DATA* variant writes the same constant ("current")
@@ -311,6 +318,81 @@ static void vtx_const_fold(rsx_dispatch* rsx, u32 m, u32 arg)
     }
 }
 
+/* Immediate-mode vertices. Between BEGIN_END(prim) and BEGIN_END(0) a title
+ * may skip vertex arrays and INLINE_ARRAY entirely and set each vertex's
+ * attributes through the SET_VERTEX_DATA* registers; writing the last word
+ * of attribute 0 (the position) emits a vertex carrying the current value of
+ * every attribute -- glBegin/glVertex. A Crack in Time draws its Bink movie
+ * frames that way: one QUADS primitive per frame, positions and UVs in
+ * DATA2S, three YUV plane textures. Without this the primitive arrived empty
+ * and every movie played as a black screen.
+ *
+ * The vertices are packed as an INLINE_ARRAY stream (float4 per attribute
+ * the vertex program reads, ascending index order, big-endian words) so the
+ * sink draws them through the ordinary inline path; END swaps a matching
+ * float4 VTXFMT declaration in for the draw and restores the title's after. */
+static int imm_is_attr0_last_word(u32 m)
+{
+    return m == 0x1E40 /*1F*/ || m == 0x1884 /*2F*/ || m == 0x1508 /*3F*/ ||
+           m == 0x1900 /*2S*/ || m == 0x1940 /*4UB*/ || m == 0x1984 /*4S*/ ||
+           m == 0x0A84 /*SCALED4S*/ || m == 0x1C0C /*4F*/;
+}
+
+/* Room for `more` bytes past inline_len; 0 = past RSX_DSP_INLINE_MAX_BYTES
+ * (or out of memory), and the stream is counted as dropped. */
+static int inline_reserve(rsx_dispatch* rsx, u32 more)
+{
+    if (rsx->inline_overflow) return 0;
+    const u64 need = (u64)rsx->inline_len + more;
+    if (need <= rsx->inline_cap) return 1;
+    if (need <= RSX_DSP_INLINE_MAX_BYTES) {
+        u64 cap = rsx->inline_cap ? rsx->inline_cap : 65536u;
+        while (cap < need) cap *= 2u;
+        if (cap > RSX_DSP_INLINE_MAX_BYTES) cap = RSX_DSP_INLINE_MAX_BYTES;
+        u8* grown = (u8*)realloc(rsx->inline_data, (size_t)cap);
+        if (grown) { rsx->inline_data = grown; rsx->inline_cap = (u32)cap; return 1; }
+    }
+    rsx->inline_overflow = 1;
+    rsx->inline_len = 0;
+    rsx->inline_dropped++;
+    { static int said;
+      if (said++ < 4)
+          fprintf(stderr, "[rsx-dispatch] inline vertex stream past %u bytes: dropped (%u so far)\n",
+                  (unsigned)RSX_DSP_INLINE_MAX_BYTES, rsx->inline_dropped); }
+    return 0;
+}
+
+static void imm_emit_vertex(rsx_dispatch* rsx)
+{
+    if (rsx->imm_vertices == 0) {
+        u32 mask = rsx->regs[M_VP_ATTRIB_EN >> 2] & 0xFFFFu;
+        mask |= 1u;                              /* position always       */
+        u32 n = 0;
+        for (u32 a = 0; a < 16; a++)
+            if (mask & (1u << a)) { if (++n > 15) mask &= ~(1u << a); }  /* stride fits 8 bits */
+        rsx->imm_attr_mask = mask;
+        rsx->inline_len = 0;
+        rsx->inline_overflow = 0;
+    }
+    u32 n = 0;
+    for (u32 a = 0; a < 16; a++) if (rsx->imm_attr_mask & (1u << a)) n++;
+    const u32 stride = n * 16u;
+    if (!inline_reserve(rsx, stride)) return;
+    u8* o = rsx->inline_data + rsx->inline_len;
+    for (u32 a = 0; a < 16; a++) {
+        if (!(rsx->imm_attr_mask & (1u << a))) continue;
+        float v[4];
+        rsx_dsp_vertex_default(rsx, a, v);
+        for (u32 c = 0; c < 4; c++) {
+            u32 w; memcpy(&w, &v[c], 4);
+            o[0] = (u8)(w >> 24); o[1] = (u8)(w >> 16); o[2] = (u8)(w >> 8); o[3] = (u8)w;
+            o += 4;
+        }
+    }
+    rsx->inline_len += stride;
+    rsx->imm_vertices++;
+}
+
 void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 {
     method &= 0xFFFFC;
@@ -328,10 +410,28 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         return;
     }
     rsx->seen[idx]++;
+    /* RSX_DSP_WATCH=<hex method>: every write to that method (subchannel
+     * bits included), value and whether it changed, RSX_DSP_WATCH_MAX lines. */
+    { static long w = -2, wmax = 400, wn = 0;
+      if (w == -2) { const char* e = getenv("RSX_DSP_WATCH"); w = e ? (long)strtoul(e, 0, 16) : -1;
+                     const char* m = getenv("RSX_DSP_WATCH_MAX"); if (m) wmax = atol(m); }
+      if (w >= 0 && (long)method == w && wn < wmax) {
+          wn++;
+          fprintf(stderr, "[rsx watch] method 0x%04X = 0x%08X%s%c", method, arg, rsx->regs[idx] != arg ? " (changed)" : "", 10);
+      } }
+    if (method >= M_TEX_OFFSET && method < M_TEX_OFFSET + RSX_DSP_NUM_TEXTURES * 0x20u) {
+        if (rsx->regs[idx] != arg) { rsx->tex_gen[(method - M_TEX_OFFSET) >> 5]++; rsx->tex_gen_all++; }
+    } else if (method >= M_TEX_SIZE1 && method < M_TEX_SIZE1 + RSX_DSP_NUM_TEXTURES * 4u) {
+        if (rsx->regs[idx] != arg) { rsx->tex_gen[(method - M_TEX_SIZE1) >> 2]++; rsx->tex_gen_all++; }
+    } else if (method >= M_VERTEX_TEXTURE && method < M_VERTEX_TEXTURE + RSX_DSP_NUM_VERTEX_TEXTURES * 0x20u) {
+        if (rsx->regs[idx] != arg) rsx->vtex_gen++;
+    }
     rsx->regs[idx] = arg;
     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
         (method >= 0x0A80 && method < 0x0B00))
         vtx_const_fold(rsx, method, arg);
+    if (rsx->in_begin_end && imm_is_attr0_last_word(method))
+        imm_emit_vertex(rsx);
 
     /* Completing a position emits a register-based vertex: the last word of
      * ATTR0 in any of its immediate encodings. Other attributes update the
@@ -359,8 +459,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         const u32 lane = ((method - M_VP_UPLOAD_INST) >> 2) & 3;
         u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
         const u32 pos = *load * 4 + lane;
-        if (pos < RSX_DSP_VP_WORDS)
+        if (pos < RSX_DSP_VP_WORDS && rsx->vp[pos] != arg) {
             rsx->vp[pos] = arg;
+            rsx->vp_gen++;
+        }
         if (lane == 3)
             (*load)++;
         return;
@@ -372,8 +474,15 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
     if (method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) {
         const u32 word = (method - M_VP_UPLOAD_CONST) >> 2;
         const u32 slot = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2] + (word >> 2);
-        if (slot < RSX_DSP_NUM_CONSTANTS)
+        if (slot < RSX_DSP_NUM_CONSTANTS) {
             rsx->constants[slot][word & 3] = arg;
+            if (rsx->const_dirty_lo == rsx->const_dirty_hi) {
+                rsx->const_dirty_lo = slot; rsx->const_dirty_hi = slot + 1u;
+            } else {
+                if (slot < rsx->const_dirty_lo) rsx->const_dirty_lo = slot;
+                if (slot + 1u > rsx->const_dirty_hi) rsx->const_dirty_hi = slot + 1u;
+            }
+        }
         /* RSX_CONST_LOG=<lo>,<hi>: every transform-constant upload into that
          * slot range (first 400) -- what a shader's constants really were. */
         { static int lo = -2, hi = 0, n = 0;
@@ -396,10 +505,29 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->in_begin_end = 1;
             rsx->current_primitive = arg;
             rsx->inline_len = 0;
+            rsx->inline_overflow = 0;
+            rsx->imm_vertices = 0;
             if (rsx->sink.begin)
                 rsx->sink.begin(rsx->sink.user, rsx, arg);
         } else {
             rsx->in_begin_end = 0;
+            /* Immediate-mode vertices: declare them as float4 attributes for
+             * this one draw (see imm_emit_vertex). */
+            u32 saved_fmt[16];
+            const int imm = rsx->imm_vertices != 0;
+            if (imm) {
+                u32 n = 0;
+                for (u32 a = 0; a < 16; a++) if (rsx->imm_attr_mask & (1u << a)) n++;
+                for (u32 a = 0; a < 16; a++) {
+                    saved_fmt[a] = rsx->regs[(M_VTXFMT >> 2) + a];
+                    rsx->regs[(M_VTXFMT >> 2) + a] = (rsx->imm_attr_mask & (1u << a))
+                        ? (2u /*F32*/ | (4u << 4) | ((n * 16u) << 8)) : 2u /* size 0: disabled */;
+                }
+                { static int said = 0;
+                  if (!said) { said = 1;
+                      fprintf(stderr, "[rsx-dispatch] immediate-mode primitive %u: %u vertices, attrs 0x%04X\n",
+                              rsx->current_primitive, rsx->imm_vertices, rsx->imm_attr_mask); } }
+            }
             /* Hand an inline stream over BEFORE end: the sink reads end as
              * "draw what you have", so a batch delivered after it would be
              * drawn one primitive late, or not at all. */
@@ -409,6 +537,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
             rsx->inline_len = 0;
             if (rsx->sink.end)
                 rsx->sink.end(rsx->sink.user, rsx);
+            if (imm) {
+                for (u32 a = 0; a < 16; a++) rsx->regs[(M_VTXFMT >> 2) + a] = saved_fmt[a];
+                rsx->imm_vertices = 0;
+            }
         }
         break;
 
@@ -426,17 +558,16 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
      * carrying no vertices at all: the backend saw BEGIN/END with nothing
      * between them and counted an empty group. */
     case M_INLINE_ARRAY:
-        if (rsx->inline_len + 4u <= RSX_DSP_INLINE_MAX_BYTES) {
+        /* Past the cap the whole stream is dropped (inline_reserve). This
+         * used to empty the buffer and go on filling it, so the draw got the
+         * stream's tail alone: the time bomb's bubble lost a run of its
+         * quads, a square hole wherever they fell on screen. */
+        if (inline_reserve(rsx, 4u)) {
             rsx->inline_data[rsx->inline_len + 0] = (u8)(arg >> 24);
             rsx->inline_data[rsx->inline_len + 1] = (u8)(arg >> 16);
             rsx->inline_data[rsx->inline_len + 2] = (u8)(arg >> 8);
             rsx->inline_data[rsx->inline_len + 3] = (u8)arg;
             rsx->inline_len += 4;
-        } else if (rsx->inline_len) {
-            /* Truncating leaves a torn final vertex; drop the whole stream
-             * and count it instead of drawing something half-read. */
-            rsx->inline_len = 0;
-            rsx->inline_dropped++;
         }
         break;
 
@@ -461,6 +592,46 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
 
     default:
         break;
+    }
+}
+
+/* Words [first, first + n) of the transform-constant window, big-endian as
+ * the FIFO holds them: rsx_dispatch_method for each of them, at once. The
+ * window is most of what a frame sends (A Crack in Time's Axiom: ~90% of
+ * ~380K words a frame), and a call or two per word was most of the RSX
+ * thread outside the draws. */
+void rsx_dispatch_const_words(rsx_dispatch* rsx, u32 first, const u8* be, u32 n)
+{
+    static int logging = -1;
+    if (logging < 0) logging = getenv("RSX_CONST_LOG") ? 1 : 0;
+    if (logging || first + n > 32u) {
+        for (u32 w = 0; w < n; w++) {
+            u32 v; memcpy(&v, be + w * 4u, 4);
+            rsx_dispatch_method(rsx, M_VP_UPLOAD_CONST + (first + w) * 4u, __builtin_bswap32(v));
+        }
+        return;
+    }
+    const u32 ridx = (M_VP_UPLOAD_CONST >> 2) + first;
+    u32* regs = &rsx->regs[ridx];
+    for (u32 w = 0; w < n; w++) {
+        u32 v; memcpy(&v, be + w * 4u, 4);
+        regs[w] = __builtin_bswap32(v);
+        rsx->seen[ridx + w]++;
+    }
+    /* constants[] is one row-major array: word i of the burst lands at
+     * constants[id][0] + first + i, as far as the file reaches. */
+    const u32 id = rsx->regs[M_VP_UPLOAD_CONST_ID >> 2];
+    const u64 start = (u64)id * 4u + first;
+    if (start >= (u64)RSX_DSP_NUM_CONSTANTS * 4u) return;
+    u32 cnt = n;
+    if (start + cnt > (u64)RSX_DSP_NUM_CONSTANTS * 4u) cnt = (u32)((u64)RSX_DSP_NUM_CONSTANTS * 4u - start);
+    memcpy(&rsx->constants[0][0] + start, regs, (size_t)cnt * 4u);
+    const u32 slo = (u32)(start >> 2), shi = (u32)((start + cnt + 3u) >> 2);
+    if (rsx->const_dirty_lo == rsx->const_dirty_hi) {
+        rsx->const_dirty_lo = slo; rsx->const_dirty_hi = shi;
+    } else {
+        if (slo < rsx->const_dirty_lo) rsx->const_dirty_lo = slo;
+        if (shi > rsx->const_dirty_hi) rsx->const_dirty_hi = shi;
     }
 }
 

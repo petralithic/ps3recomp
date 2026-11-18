@@ -44,6 +44,8 @@ typedef struct rsx_vertex_remap {
     rsx_vertex_remap_slot* slots;
     u32 slot_capacity;
     u32 generation;
+    u64* direct;            /* (generation << 32) | unique, by vertex_id - min */
+    u32 direct_capacity;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {

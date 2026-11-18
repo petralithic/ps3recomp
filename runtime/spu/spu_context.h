@@ -14,6 +14,9 @@
 #include "../../include/ps3emu/log_first.h"
 #include <stdint.h>
 #include <string.h>
+#if defined(__SSSE3__)
+#include <tmmintrin.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -56,8 +59,18 @@ extern "C" {
 extern int g_spu_ls_watch_n;
 void spu_ls_watch_slow(uint32_t lsa, int is_write, const uint8_t* p, uint32_t pc, uint32_t lr);
 unsigned* spu_ls_watch_list(int* out_n);   /* the armed lines (n may be 0) */
+/* SPU_LS_DIAG=0 (a port's lifted sources, per TU): local-store accesses
+ * without the watch and probe hooks. Each is a cold call on every access,
+ * and a possible call makes the compiler write every live register back to
+ * ctx first. */
+#ifndef SPU_LS_DIAG
+#define SPU_LS_DIAG 1
+#endif
 static inline void spu_ls_watch_hit2(uint32_t lsa, int is_write, const uint8_t* p,
                                      uint32_t pc, uint32_t lr) {
+#if !SPU_LS_DIAG
+    (void)lsa; (void)is_write; (void)p; (void)pc; (void)lr; return;
+#endif
     if (__builtin_expect(g_spu_ls_watch_n == 0, 1)) return;
     spu_ls_watch_slow(lsa, is_write, p, pc, lr);
 }
@@ -179,6 +192,16 @@ typedef struct spu_channel {
 /* ---------------------------------------------------------------------------
  * SPU execution context
  * -----------------------------------------------------------------------*/
+/* Lifted SPU functions take their context as `spu_context* SPU_RESTRICT ctx`.
+ * Nothing else touches a running SPU's registers, and local store is reached
+ * through ctx->ls (a pointer loaded from the context, so not "based on" ctx),
+ * which lets the compiler keep guest registers in host registers across the
+ * LS loads and stores that make up most SPU code -- without it every LS store
+ * forced every live register back to memory. -DSPU_RESTRICT= turns it off. */
+#ifndef SPU_RESTRICT
+#  define SPU_RESTRICT __restrict
+#endif
+
 typedef struct spu_context {
     /* 128 general-purpose 128-bit registers */
     SPU_ALIGN16 u128 gpr[128];
@@ -421,6 +444,15 @@ typedef struct spu_context {
      * manager then ran its buffer loop a second time on the job's registers
      * and died in its own assert (the song-freeze). */
     uint32_t drain_ret_pc;
+    uint32_t drain_ret_sp;   /* racacit: r1 at the drain call; a return must restore it */
+
+    /* racacit: runtime base minus lift base of the relocatable image being
+     * run (RACiT's spu_lifter.py --reloc, spu_mark_overlay_relocatable). A job
+     * loads some modules at a base of its own choosing -- one in A Crack in
+     * Time at dozens of bases -- and the lifted code adds this to every address
+     * it derives from its own position. Set by spu_lookup_ctx on each hit (0 for
+     * a fixed image). Upstream's reloc_delta/canon registration is separate. */
+    uint32_t ls_delta;
 
     /* Set by another host thread to stop this SPU from outside: a raw SPU's
      * PPU writing SPU_RunCntl = 0 (spu_raw.c). Lifted code never looks at it;
@@ -644,8 +676,10 @@ static SPU_NOINLINE_COLD void spu_ls_read_diag(const spu_context* ctx, uint32_t 
 static inline u128 spu_ls_read128(const spu_context* ctx, uint32_t lsa)
 {
     u128 v;
+#if SPU_LS_DIAG
     if (__builtin_expect(g_spu_ls_rdiag != 0, 0))
         spu_ls_read_diag(ctx, lsa);
+#endif
     lsa &= SPU_LS_MASK & ~0xFu;
     const uint8_t* p = &ctx->ls[lsa];
 #if defined(__ARM_NEON)
@@ -747,6 +781,15 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
 {
     lsa &= SPU_LS_MASK & ~0xFu;
     uint8_t* p = &ctx->ls[lsa];
+    /* racacit: SPU_LS_FILL_GUARD=1 builds name the lifted function storing
+     * the 0x8000 fill pattern into the policy module (LS < 0x2000) -- the
+     * runaway fill that once wiped local store and hung the job pipeline. */
+#if SPU_LS_FILL_GUARD
+    if (lsa < 0x2000u && val._u32[0] == 0x80008000u && val._u32[3] == 0x80008000u) {
+        extern void spu_ls_fill_guard(spu_context*, uint32_t);
+        spu_ls_fill_guard(ctx, lsa);
+    }
+#endif
 #if defined(__ARM_NEON)
     vst1q_u8(p, vrev32q_u8(vld1q_u8(val._u8)));   /* rev32; str q */
 #elif SPU_LS_VEC
@@ -765,8 +808,10 @@ static inline void spu_ls_write128(spu_context* ctx, uint32_t lsa, u128 val)
         p[i*4 + 3] = (uint8_t)w;
     }
 #endif
+#if SPU_LS_DIAG
     if (__builtin_expect(g_spu_ls_wdiag != 0, 0))
         spu_ls_write_diag(ctx, lsa, val);
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -824,7 +869,12 @@ static inline u128 spu_make_preferred_u32(uint32_t val)
 #define SPU_CH_LOCK(ch)   while (_InterlockedExchange(&(ch)->lock, 1)) _mm_pause()
 #define SPU_CH_UNLOCK(ch) _InterlockedExchange(&(ch)->lock, 0)
 #else
+#if defined(_WIN32)
+void spu_spin_wait(volatile long* lock);   /* spu_coherency.c: pause, yield; never a bare exchange loop */
+#define SPU_CH_LOCK(ch)   while (__atomic_exchange_n(&(ch)->lock, 1, __ATOMIC_ACQUIRE)) spu_spin_wait(&(ch)->lock)
+#else
 #define SPU_CH_LOCK(ch)   while (__atomic_exchange_n(&(ch)->lock, 1, __ATOMIC_ACQUIRE)) {}
+#endif
 #define SPU_CH_UNLOCK(ch) __atomic_store_n(&(ch)->lock, 0, __ATOMIC_RELEASE)
 #endif
 

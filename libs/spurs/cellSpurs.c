@@ -16,6 +16,7 @@
 #include "spurs_taskset.h"  /* REAL BE CellSpursTaskset layout builders (fork Option-B) */
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
 #include "ps3emu/ps3_tprof.h"    /* PS3_TPROF: in-process samples of the SPU workers */
+#include "../../runtime/ppu/ppu_context.h"  /* g_active_ctx: stack-passed args */
 #include <stdio.h>
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
@@ -40,6 +41,7 @@ uint32_t g_ydkj_real_spurs_ea   = 0;   /* real CellSpurs instance EA (for the ta
 #else
 #include <pthread.h>
 #include <time.h>
+u32 spurs_hle_spu_tid(u32 spurs_ea, u32 spu);
 #endif
 #include "ps3emu/thread_name.h"
 
@@ -1840,13 +1842,24 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
         *(vm_base + (u32)attr_ea + WKATTR_PRIORITY + i) =
             prio_ea ? *(vm_base + (u32)prio_ea + i) : 0;
     vm_write32((u32)attr_ea + WKATTR_MIN_CONT, minContention);
-    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, 1);   /* 9th arg is beyond the 8-GPR adapter */
+    /* maxContention is the 9th argument: past r3..r10, in the caller's
+     * parameter save area at r1+0x70 (PPC64 ELF ABI, one doubleword). It used
+     * to be hard-wired to 1, which pinned every workload to one SPU -- fatal
+     * for A Crack in Time's igPm, whose collision broad and narrow phase run as
+     * two resident job managers on two SPUs (queue = SNR1) and deadlock on one. */
+    u32 maxContention = 1;
+    { extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+      if (g_active_ctx) {
+          u32 v = (u32)vm_read64((u32)g_active_ctx->gpr[1] + 0x70u);
+          if (v >= 1 && v <= CELL_SPURS_MAX_SPU) maxContention = v;
+      } }
+    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, maxContention);
     vm_write32((u32)attr_ea + WKATTR_NAME_CLASS, 0);
     vm_write32((u32)attr_ea + WKATTR_NAME_INST,  0);
     vm_write32((u32)attr_ea + WKATTR_HOOK,     0);
     vm_write32((u32)attr_ea + WKATTR_HOOK_ARG, 0);
-    printf("[cellSpurs] _WorkloadAttributeInitialize(attr=0x%08X pm=0x%08X size=%u data=0x%llX minC=%u)\n",
-           (u32)attr_ea, (u32)pm_ea, size, (unsigned long long)data, minContention);
+    printf("[cellSpurs] _WorkloadAttributeInitialize(attr=0x%08X pm=0x%08X size=%u data=0x%llX minC=%u maxC=%u)\n",
+           (u32)attr_ea, (u32)pm_ea, size, (unsigned long long)data, minContention, maxContention);
     return CELL_OK;
 }
 
@@ -1992,6 +2005,16 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
     ps3_tprof_thread('S', (uint32_t)slot->spu_num);
+#ifdef _WIN32
+    /* racacit: PS3_SAMPLE_SPURS=<n> profiles virtual SPU n-1 only; "all" adds
+     * every SPU worker in turn (scripts/dev/hot_funcs.py). */
+    { const char* e = getenv("PS3_SAMPLE_SPURS");
+      extern void ps3_samp_only_tid(unsigned long tid);
+      extern long ps3_samp_add_tid(unsigned long tid);
+      extern _Thread_local int t_samp_slot;   /* spu_drain.c: PS3_SAMPLE_JOB */
+      if (e && !strcmp(e, "all")) t_samp_slot = (int)ps3_samp_add_tid(GetCurrentThreadId());
+      else if (e && (u32)atoi(e) == (u32)slot->spu_num + 1u) ps3_samp_only_tid(GetCurrentThreadId()); }
+#endif
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {
         while (!slot->busy && !si->stopping)
@@ -2017,6 +2040,21 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     ps3_tprof_thread_exit();
     return 0;
 }
+
+unsigned long long ps3_us_now_dbg(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER f; LARGE_INTEGER c;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (unsigned long long)(c.QuadPart / f.QuadPart) * 1000000ull +
+           (unsigned long long)(c.QuadPart % f.QuadPart) * 1000000ull / (unsigned long long)f.QuadPart;
+#else
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000ull;
+#endif
+}
+
 
 static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
@@ -3423,16 +3461,55 @@ s32 cellSpursRequestIdleSpu(u64 spurs_ea, u64 wid64, u64 count64)
     return CELL_OK;
 }
 
+u32 spurs_hle_spu_tid(u32 spurs_ea, u32 spu);   /* racacit: defined below */
+
 s32 cellSpursGetInfo(u64 spurs_ea, u64 info_ea)
 {
     struct SpursInst* si = spurs_inst_find((u32)spurs_ea);
     static int _n = 0;
     if (PS3_LOG_FIRST(_n, 4)) printf("[cellSpurs] GetInfo(spurs=0x%08X info=0x%08X)\n", (u32)spurs_ea, (u32)info_ea);
     if (info_ea) {
-        vm_write32((u32)info_ea, si ? si->nspus : 1);   /* nSpus */
+        u32 n = si ? si->nspus : 1;
+        vm_write32((u32)info_ea, n);   /* nSpus */
         for (int o = 4; o < 0x28; o += 4) vm_write32((u32)info_ea + o, 0);
+        /* racacit: spuThreads[8] at +0x28. There are no real SPU threads under
+         * HLE SPURS, but titles address them -- A Crack in Time writes each
+         * one's SNR1 with its index, which igPm reads to pick its job queue.
+         * Hand out synthetic ids that sys_spu_thread_write_snr recognises. */
+        for (u32 i = 0; i < 8; i++)
+            vm_write32((u32)info_ea + 0x28 + 4 * i, i < n ? spurs_hle_spu_tid((u32)spurs_ea, i) : 0);
     }
     return CELL_OK;
+}
+
+/* ---- racacit: SNR values for HLE SPURS virtual SPUs ---------------------- */
+#define SPURS_SNR_SLOTS 8
+static struct { u32 spurs; u32 val[SPURS_SNR_SLOTS][2]; u8 set[SPURS_SNR_SLOTS][2]; } s_spurs_snr[4];
+u32 spurs_hle_spu_tid(u32 spurs_ea, u32 spu)
+{
+    for (u32 k = 0; k < 4; k++) {
+        if (s_spurs_snr[k].spurs == spurs_ea || s_spurs_snr[k].spurs == 0) {
+            s_spurs_snr[k].spurs = spurs_ea;
+            return 0x7E000000u | (k << 8) | (spu & 0xFF);
+        }
+    }
+    return 0x7E000000u | 0x300u | (spu & 0xFF);
+}
+int spurs_hle_write_snr(u32 tid, u32 num, u32 val)
+{
+    if ((tid & 0xFFFFF000u) != 0x7E000000u || num > 1) return 0;
+    u32 k = (tid >> 8) & 0xF, spu = tid & 0xFF;
+    if (k >= 4 || spu >= SPURS_SNR_SLOTS) return 0;
+    s_spurs_snr[k].val[spu][num] = val; s_spurs_snr[k].set[spu][num] = 1;
+    printf("[cellSpurs] SNR%u of SPURS 0x%08X spu %u <- 0x%X\n", num + 1, s_spurs_snr[k].spurs, spu, val);
+    return 1;
+}
+int spurs_hle_get_snr(u32 spurs_ea, u32 spu, u32 num, u32* out)
+{
+    for (u32 k = 0; k < 4; k++)
+        if (s_spurs_snr[k].spurs == spurs_ea && spu < SPURS_SNR_SLOTS && num < 2 && s_spurs_snr[k].set[spu][num]) {
+            *out = s_spurs_snr[k].val[spu][num]; return 1; }
+    return 0;
 }
 
 s32 cellSpursSetExceptionEventHandler(u64 spurs_ea, u64 handler_ea, u64 arg_ea)
@@ -3772,3 +3849,258 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
     return CELL_OK;
 }
+
+/* PORT PATCH (racacit): the three cellSpurs imports A Crack in Time had
+ * unresolved. PushBody starts as a logging probe (RACACIT_LFQ_TRACE) so the
+ * element layout the game pushes can be observed. */
+s32 cellSpursLFQueueDetachLv2EventQueue(u64 queue_ea)
+{
+    (void)queue_ea;
+    return CELL_OK;
+}
+
+s32 cellSpursSetGlobalExceptionEventHandler(u64 spurs_ea, u64 handler_ea, u64 arg_ea)
+{
+    (void)spurs_ea; (void)handler_ea; (void)arg_ea;
+    return CELL_OK;
+}
+
+/* ---------------------------------------------------------------------------
+ * PORT PATCH (racacit): native Edge zlib inflate queue.
+ *
+ * Sony Edge's zlib inflater runs as a SPURS task fed through an ANY2ANY
+ * cellSpursLFQueue of 32-byte elements; ps3recomp has no LFQueue push/pop
+ * (the ANY2ANY protocol is not modelled), so the task never gets work and
+ * every caller blocks on the completion event flag. Observed element layout
+ * (A Crack in Time, PSARC block reads):
+ *   +0x00 src EA (raw deflate, no zlib header)   +0x04 dst EA
+ *   +0x08 compressed size                         +0x0C max uncompressed size
+ *   +0x10 work-to-do counter EA (low 2 bits tag)  +0x14 CellSpursEventFlag EA
+ *   +0x18 u16 event-flag bits                     +0x1C 0
+ * Done natively at push time: inflate (stored-block fallback: memcpy), then
+ * atomically decrement the counter and, at zero, set the flag bits -- what the
+ * SPU task does on completion. Faster than interpreting the SPU task, and
+ * needs no SPU. RACACIT_LFQ_TRACE=1 logs each element.
+ * -----------------------------------------------------------------------*/
+#include "zlib.h"
+
+static u32 be32_atomic_dec(u32 ea)
+{
+    uint32_t* p = (uint32_t*)(vm_base + ea);
+    uint32_t old = __atomic_load_n(p, __ATOMIC_SEQ_CST), nw;
+    for (;;) {
+        u32 v = __builtin_bswap32(old);
+        nw = __builtin_bswap32(v - 1);
+        if (__atomic_compare_exchange_n(p, &old, nw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+            return v - 1;
+    }
+}
+
+
+/* RACACIT_LFQ_VERIFY's record of VRAM outputs: dst, length, CRC. */
+enum { EZ_VN = 16384 };
+static struct { u32 dst, len, crc; int n; } s_ez_ring[EZ_VN];
+static volatile LONG s_ez_lock; static u32 s_ez_head;
+static void edgezlib_note(u32 dst, u32 len, int n)
+{
+    const u32 crc = (u32)crc32(0, vm_base + dst, len);
+    while (InterlockedExchange(&s_ez_lock, 1)) YieldProcessor();
+    const u32 h = s_ez_head++ % EZ_VN;
+    s_ez_ring[h].dst = dst; s_ez_ring[h].len = len; s_ez_ring[h].crc = crc; s_ez_ring[h].n = n;
+    InterlockedExchange(&s_ez_lock, 0);
+}
+/* Before an RSX copy reads [ea, ea+len): every recorded output wholly inside
+ * that still has its CRC? Logs the ones that do not. */
+void edgezlib_check_range(u32 ea, u32 len)
+{
+    static int logs;
+    if (!s_ez_head || logs >= 300) return;
+    while (InterlockedExchange(&s_ez_lock, 1)) YieldProcessor();
+    const u32 m = s_ez_head < EZ_VN ? s_ez_head : EZ_VN;
+    for (u32 i = 0; i < m; i++) {
+        if (!s_ez_ring[i].len || s_ez_ring[i].dst < ea || s_ez_ring[i].dst + s_ez_ring[i].len > ea + len) continue;
+        const u32 c = (u32)crc32(0, vm_base + s_ez_ring[i].dst, s_ez_ring[i].len);
+        if (c != s_ez_ring[i].crc && logs < 300) { logs++;
+            fprintf(stderr, "[edgezlib] MOVE-CHECK: #%d dst=0x%08X len %u changed between its inflate and an RSX copy out of 0x%08X+0x%X%c",
+                    s_ez_ring[i].n, s_ez_ring[i].dst, s_ez_ring[i].len, ea, len, 10); }
+        s_ez_ring[i].len = 0;            /* moved out: forget it */
+    }
+    InterlockedExchange(&s_ez_lock, 0);
+}
+
+/* One queued Edge zlib element, copied at push time: the element itself and
+ * its compressed input (the caller's read buffer is reused for the next
+ * block as soon as it may be). */
+typedef struct ez_job {
+    struct ez_job* next;
+    u32 dst, csz, max, cnt, flag, head, tail;
+    u16 bits;
+    int n;
+    uint8_t in[];
+} ez_job;
+
+/* Inflate one element into guest memory, then complete it as the SPU task
+ * does: decrement the work counter, and at zero set the event flag bits. */
+static void ez_process(ez_job* j)
+{
+    static int trace = -1;
+    if (trace < 0) trace = getenv("RACACIT_LFQ_TRACE") ? 1 : 0;
+    const u32 dst = j->dst, csz = j->csz, max = j->max, head = j->head, tail = j->tail;
+    u32 out = 0;
+    int r = -1;
+    z_stream zs;
+    if (head || tail) {
+        /* +0x1A / +0x1C (u16): bytes of the segment's uncompressed output to
+         * drop before and after the `max` bytes the caller wants -- a window
+         * into one Edge zlib segment (head + max + tail = the segment's full
+         * size, 64 KB at most). A Crack in Time's streaming reader pulls 8 KB
+         * slices out of a segment this way. */
+        static __thread uint8_t* win = NULL;            /* per thread: inline pushes run concurrently */
+        const u32 total = head + max + tail;
+        if (!win) win = (uint8_t*)malloc(0x10000 + 0x100);
+        if (win && total <= 0x10000) {
+            memset(&zs, 0, sizeof zs);
+            if (inflateInit2(&zs, -15) == Z_OK) {
+                zs.next_in = j->in; zs.avail_in = csz; zs.next_out = win; zs.avail_out = total;
+                do { r = inflate(&zs, Z_NO_FLUSH); } while (r == Z_OK && zs.avail_in && zs.avail_out);
+                const u32 got = (u32)zs.total_out;
+                inflateEnd(&zs);
+                if (got > head) {
+                    u32 k = got - head; if (k > max) k = max;
+                    memcpy(vm_base + dst, win + head, k); out = k;
+                }
+                r = (out == max || r == Z_STREAM_END) ? 0 : (r == Z_OK ? 0 : r);
+            }
+            /* A stored (uncompressed) segment does not inflate: its bytes are
+             * the data, as the unwindowed path below copies them. Writing
+             * nothing left the slice's old contents in place. */
+            if (r != 0 && csz >= total) {
+                memcpy(vm_base + dst, j->in + head, max);
+                out = max; r = 0;
+                static int sn; if (sn < 8) { sn++;
+                    fprintf(stderr, "[edgezlib] stored segment slice: copied %u bytes at +0x%X to 0x%08X%c", max, head, dst, 10); }
+            }
+        }
+    } else {
+        memset(&zs, 0, sizeof zs);
+        if (inflateInit2(&zs, -15) == Z_OK) {
+            zs.next_in = j->in; zs.avail_in = csz; zs.next_out = vm_base + dst; zs.avail_out = max;
+            do { r = inflate(&zs, Z_NO_FLUSH); } while (r == Z_OK && zs.avail_in && zs.avail_out);
+            out = (u32)zs.total_out;
+            if (r != Z_STREAM_END) {
+                static int en; if (en < 8) { en++;
+                    fprintf(stderr, "[edgezlib] inflate r=%d msg=%s in_left=%u out=%u%c", r, zs.msg ? zs.msg : "-", zs.avail_in, out, 10); }
+            }
+            inflateEnd(&zs);
+            r = (r == Z_STREAM_END) ? 0 : r;
+        }
+        if (r != 0 && csz <= max) {                     /* stored block: plain copy */
+            memcpy(vm_base + dst, j->in, csz);
+            out = csz;
+        }
+    }
+    if (trace || (r != 0 && j->n < 32))
+        printf("[edgezlib] #%d tid %lu csz=%u dst=0x%08X max=%u head=0x%X tail=0x%X -> %s out=%u cnt@0x%08X flag=0x%08X bits=0x%04X\n",
+               j->n, (unsigned long)GetCurrentThreadId(), csz, dst, max, head, tail, r == 0 ? "inflate" : "STORED/copy", out,
+               j->cnt, j->flag, j->bits);
+    { static int ver = -1;                              /* RACACIT_LFQ_VERIFY: see edgezlib_check_range */
+      if (ver < 0) ver = getenv("RACACIT_LFQ_VERIFY") ? 1 : 0;
+      if (ver && out && dst >= 0xC0000000u && dst < 0xD0000000u) edgezlib_note(dst, out, j->n); }
+    if (j->cnt) {
+        const u32 left = be32_atomic_dec(j->cnt);
+        if (left == 0 && j->flag)
+            cellSpursEventFlagSet((CellSpursEventFlag*)(uintptr_t)j->flag, j->bits);
+    } else if (j->flag) {
+        cellSpursEventFlagSet((CellSpursEventFlag*)(uintptr_t)j->flag, j->bits);
+    }
+}
+
+/* RACACIT_LFQ_ASYNC=1 (experiment, off): the queue's consumer as a host
+ * thread taking elements in push order, like the one SPU task that serves
+ * this queue on a PS3 -- completion after the push returns rather than inside
+ * it. Elements are processed inline by default, as they always were; the
+ * worker did not change the striped textures (that was a lifted vcmpequh.,
+ * scripts/fix_vmx_alias.py) and is kept only as a switch. */
+static SRWLOCK s_ezq_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE s_ez_cv = CONDITION_VARIABLE_INIT;
+static ez_job* s_ez_first; static ez_job* s_ez_last;
+static volatile LONG s_ez_started;
+static DWORD WINAPI ez_worker(LPVOID arg)
+{
+    (void)arg;
+    { char hb[96]; snprintf(hb, sizeof hb, "[hosttid] %lu edge zlib queue worker%c", (unsigned long)GetCurrentThreadId(), 10); fputs(hb, stderr); }
+    for (;;) {
+        AcquireSRWLockExclusive(&s_ezq_lock);
+        while (!s_ez_first) SleepConditionVariableSRW(&s_ez_cv, &s_ezq_lock, INFINITE, 0);
+        ez_job* j = s_ez_first;
+        s_ez_first = j->next;
+        if (!s_ez_first) s_ez_last = NULL;
+        ReleaseSRWLockExclusive(&s_ezq_lock);
+        ez_process(j);
+        free(j);
+    }
+    return 0;
+}
+
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 buffer_ea, u64 is_blocking)
+{
+    u32 q = (u32)queue_ea, b = (u32)buffer_ea;
+    u32 size = vm_read32(q + 0x10);
+    static volatile LONG seq;
+    const int n = (int)InterlockedIncrement(&seq);
+    (void)is_blocking;
+
+    if (size != 32) {
+        if (n < 16) printf("[cellSpurs] _LFQueuePushBody q=0x%08X size=%u -- unknown element type, dropped\n", q, size);
+        return CELL_OK;
+    }
+    const u32 src = vm_read32(b + 0x00), csz = vm_read32(b + 0x08);
+    ez_job* j = (ez_job*)malloc(sizeof(ez_job) + (csz ? csz : 1));
+    if (!j) return CELL_OK;
+    j->next = NULL; j->n = n;
+    j->dst = vm_read32(b + 0x04); j->csz = csz; j->max = vm_read32(b + 0x0C);
+    j->cnt = vm_read32(b + 0x10) & ~3u; j->flag = vm_read32(b + 0x14);
+    j->bits = (u16)(vm_read32(b + 0x18) >> 16);
+    j->head = vm_read32(b + 0x18) & 0xFFFFu;
+    j->tail = vm_read32(b + 0x1C) >> 16;
+    memcpy(j->in, vm_base + src, csz);
+    /* RACACIT_LFQ_FIFO_SYNC=1 (experiment, off): RSX copies the game has
+     * already handed to the RSX land before new data does. A Crack in Time compacts its streamed textures with NV3089 moves
+     * and then streams the next data -- often that texture's own high-res top
+     * mip -- into the VRAM the moves freed, trusting the RSX to have copied
+     * the old bytes out by then (a real one has, microseconds after the put
+     * write). Our FIFO walk is paced and can lag by a frame: a move still
+     * queued then copied the NEW bytes into the texture's new home, under a
+     * header that still described the old texture. That was a theory for the
+     * striped textures; it did not change them (the cause was a lifted
+     * vcmpequh., scripts/fix_vmx_alias.py). Kept as a switch. Bounded wait. */
+    if (j->dst >= 0xC0000000u && j->dst < 0xD0000000u) {
+        static int fs = -1;
+        if (fs < 0) { const char* e = getenv("RACACIT_LFQ_FIFO_SYNC"); fs = e ? atoi(e) : 0; }   /* opt-in: did not change the stripes */
+        extern int cellGcm_fifo_pending(void);
+        extern int cellGcm_fifo_sync(u32 timeout_us);
+        static volatile LONG n_vram, n_pend, n_late;
+        if (fs) InterlockedIncrement(&n_vram);
+        if (fs && cellGcm_fifo_pending()) {
+            const LONG p = InterlockedIncrement(&n_pend);
+            if (cellGcm_fifo_sync(20000) != 0) InterlockedIncrement(&n_late);
+            if (p <= 4 || (p & (p - 1)) == 0)
+                fprintf(stderr, "[edgezlib] VRAM element #%d arrived with RSX work queued: %s (%ld of %ld VRAM elements, %ld waits timed out)%c",
+                        n, "waited for the RSX", (long)p, (long)n_vram, (long)n_late, 10);
+        }
+    }
+    static int sync = -1;
+    if (sync < 0) sync = getenv("RACACIT_LFQ_ASYNC") ? 0 : 1;   /* inline (default) or the worker */
+    if (sync) { ez_process(j); free(j); return CELL_OK; }
+    if (!s_ez_started && InterlockedCompareExchange(&s_ez_started, 1, 0) == 0) {
+        HANDLE t = CreateThread(NULL, 0, ez_worker, NULL, 0, NULL);
+        if (t) CloseHandle(t);
+    }
+    AcquireSRWLockExclusive(&s_ezq_lock);
+    if (s_ez_last) s_ez_last->next = j; else s_ez_first = j;
+    s_ez_last = j;
+    ReleaseSRWLockExclusive(&s_ezq_lock);
+    WakeConditionVariable(&s_ez_cv);
+    return CELL_OK;
+}
+

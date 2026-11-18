@@ -1984,8 +1984,8 @@ static int vp_get_vs(const rsx_state* st)
     }
     if (getenv("VP_BYPASS")) {
         static const char anchor[] =
-            "Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);";
-        static const char repl[] = "Out.pos = float4(v[0].xy * 0.5, 0.5, 1.0);";
+            "_hpos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);";
+        static const char repl[] = "_hpos = float4(v[0].xy * 0.5, 0.5, 1.0);";
         char* at = hlsl;
         while ((at = strstr(at, anchor)) != NULL) {
             size_t n = sizeof(anchor) - 1, m = sizeof(repl) - 1;
@@ -3545,7 +3545,6 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
                           ts[24], ts[25], ts[26], ts[27], 10);
                   const u32 raw = dr->fp_addr & ~0x3u;
                   const u32 ea_main  = cellGcmResolveLocated(0, raw);
-                  const u32 ea_local = cellGcmResolveLocated(1, raw);
                   fprintf(stderr, "[FPK]   ucode main@0x%08X:", ea_main);
                   for (int b = 0; b < 48; b++) fprintf(stderr, "%s%02X", (b%16)?" ":"  |", vm_base[ea_main + b]);
                   fputc(10, stderr); }
@@ -5483,8 +5482,6 @@ static void render_frame(void)
                 { static int dcap = -1, dn = 0;
                   if (dcap < 0) { const char* e = getenv("DRAWARGS"); dcap = e ? atoi(e) : 0; }
                   if (dcap && dn < dcap) { dn++;
-                      D3D12_CPU_DESCRIPTOR_HANDLE _rh =
-                          (cur_rt >= 0) ? off_rt_rtv(cur_rt) : rtv_handle;
                       fprintf(stderr, "[DRAWARGS] verts=%u start=%u rt=%d rec=0x%08X bound=0x%08X"
                               " tex0=0x%08X texrt=%d dvp=%.0f,%.0f %.0fx%.0f%c",
                               dr->vertex_count, dr->vb_byte_offset / 256, cur_rt,
