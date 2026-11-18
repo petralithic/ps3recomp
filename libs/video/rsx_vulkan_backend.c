@@ -277,6 +277,8 @@ static void vk_device_lost_report(VkResult r);
 #ifndef PS3RECOMP_VULKAN_LOADER_PATH
 #define PS3RECOMP_VULKAN_LOADER_PATH "libvulkan.1.dylib"
 #endif
+static const char* s_vk_apple_loaded_path;
+
 static const char* vk_apple_loader(void)
 {
     const char* configured = getenv("PS3RECOMP_VULKAN_LIBRARY");
@@ -293,8 +295,12 @@ static int vk_load_library(void)
 #else
     static const char* names[] = { "libvulkan.so.1", "libvulkan.so" };
 #endif
-    for (size_t i = 0; i < sizeof names / sizeof names[0] && !s_vk.lib; i++)
+    for (size_t i = 0; i < sizeof names / sizeof names[0] && !s_vk.lib; i++) {
         s_vk.lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+#ifdef __APPLE__
+        if (s_vk.lib) s_vk_apple_loaded_path = names[i];
+#endif
+    }
     if (!s_vk.lib) {
         VK_LOG("no Vulkan loader found: %s\n", dlerror());
         return -1;
@@ -2619,7 +2625,7 @@ static void vk_window_open(const char* title)
     }
 #ifdef __APPLE__
     /* SDL and the renderer must use the same Vulkan loader. */
-    if (SDL_Vulkan_LoadLibrary(vk_apple_loader()) != 0) {
+    if (SDL_Vulkan_LoadLibrary(s_vk_apple_loaded_path) != 0) {
         VK_LOG("Vulkan loader failed: %s\n", SDL_GetError());
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
         return;
@@ -6728,6 +6734,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     s_vk.height = height ? height : 720;
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
 
+#ifdef __APPLE__
+    if (vk_load_library()) return -1;
+#endif
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
     /* The window opened at the guest's size; the image the frame is composed
      * in follows the internal resolution, so a higher one reaches the screen
@@ -6749,7 +6758,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     { unsigned u = 0, b = 0;             /* the engine's texture budget follows the card's */
       extern unsigned g_rsx_vram_budget_mb;
       if (!vk_vram_mb(&u, &b) && b) g_rsx_vram_budget_mb = b; }
+#ifndef __APPLE__
     if (vk_load_library()) return -1;
+#endif
 
     VkApplicationInfo app = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
                               .pApplicationName = "ps3recomp", .pEngineName = "ps3recomp RSX",
