@@ -1171,11 +1171,20 @@ static void vk_full_barrier(void)
  * textures would need the full barrier, but draws whose vertex program samples
  * one do not reach this path (vk_eng_pipeline drops them). Measured on an M1
  * Pro in Zolar Forest: 74 full barriers a frame, 46 of them here; with this,
- * 49.0 -> 52.3 FPS. RSX_PASS_BARRIER=full restores the full barrier. */
+ * 49.0 -> 52.3 FPS. On by default on Apple only, where it was measured;
+ * elsewhere RSX_PASS_BARRIER=narrow turns it on, and RSX_PASS_BARRIER=full
+ * restores the full barrier on Apple. */
 static void vk_pass_barrier(void)
 {
     static int full = -1;
-    if (full < 0) { const char* e = getenv("RSX_PASS_BARRIER"); full = e && !strcmp(e, "full"); }
+    if (full < 0) {
+        const char* e = getenv("RSX_PASS_BARRIER");
+#if defined(__APPLE__)
+        full = e && !strcmp(e, "full");
+#else
+        full = !(e && !strcmp(e, "narrow"));
+#endif
+    }
     s_xfer_scope = 0;
     if (full) { vk_full_barrier(); return; }
     VkMemoryBarrier mb[2] = {
@@ -5644,6 +5653,7 @@ static u32 s_pwk_cap;
 static int s_pw_keep;
 static SDL_atomic_t s_pw_next, s_pw_built, s_pw_failed, s_pw_absent, s_pw_live;
 static u32 s_pw_taken;                 /* render thread: kept pipelines its draws took */
+static SDL_atomic_t s_pw_urgent;        /* the render thread is building or waiting for a pipeline */
 static struct { vk_pw_spv* sp; u32 ns; unsigned long long t0; } s_pwj;
 
 static vk_pwk* vk_pwk_find(u64 key)
@@ -5672,6 +5682,10 @@ static int SDLCALL vk_prewarm_worker(void* arg)
     const vk_vdesc* recs = s_pw.recs;
     const u32 n = s_pw.n;
     while (f && buf && pc && !SDL_AtomicGet(&s_pw.stop)) {
+        /* A draw is waiting for a pipeline: Metal's compiler is the draw's
+         * now (it takes compiles in turn, and a queue of pre-warm builds ahead
+         * of the draw's held the frame for seconds). */
+        while ((SDL_AtomicGet(&s_pw_urgent) > 0 || SDL_AtomicGet(&s_ap.active) > 0) && !SDL_AtomicGet(&s_pw.stop)) SDL_Delay(2);
         const u32 i = (u32)SDL_AtomicAdd(&s_pw_next, 1);
         if (i >= n) break;
         const vk_vdesc* d = &recs[i];
@@ -6001,7 +6015,16 @@ static void vk_ap_stop(void)
     s_ap.th = NULL; s_ap.off = 1;
 }
 
+static VkPipeline vk_eng_variant_make(vk_eng_pipe* P, u32 topo_idx);
 static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
+{
+    if (P->variant[topo_idx]) return P->variant[topo_idx];
+    SDL_AtomicAdd(&s_pw_urgent, 1);
+    const VkPipeline v = vk_eng_variant_make(P, topo_idx);
+    SDL_AtomicAdd(&s_pw_urgent, -1);
+    return v;
+}
+static VkPipeline vk_eng_variant_make(vk_eng_pipe* P, u32 topo_idx)
 {
     if (P->variant[topo_idx]) return P->variant[topo_idx];
     if (vk_ap_mode() == 2)

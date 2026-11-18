@@ -247,6 +247,12 @@ static void settings_save(void)
     settings_save_file();
     SDL_AtomicUnlock(&save_lock);
 }
+/* Write pending settings now (the menu's Restart, game/restart.cpp). */
+void rsx_host_ui_flush_settings(void)
+{
+    if (s_dirty_ms) { settings_save(); s_dirty_ms = 0; }
+}
+
 static void settings_save_file(void)
 {
     const char* path = getenv("RACACIT_SETTINGS_FILE");
@@ -1915,6 +1921,8 @@ static void tr_page(ui_out* o, float x0, float x1, float y, float y1, float pad)
     UNLOCK();
 }
 
+#include "rsx_perf_graph.h"
+
 int rsx_host_ui_build(const rsx_ui_font* f, int sw, int sh, rsx_ui_vtx* out, int cap)
 {
     if (!f || !f->pixels || sw <= 0 || sh <= 0) return 0;
@@ -1924,13 +1932,7 @@ int rsx_host_ui_build(const rsx_ui_font* f, int sw, int sh, rsx_ui_vtx* out, int
     const float px = (float)f->px, lh = (float)f->line_h;
 
     if (s_sv_active) { sv_build(&o, sw, sh); return o.n; }
-    if (opt.fps && !s_open) {
-        char b[64]; LOCK(); memcpy(b, s_fps_text, sizeof b); UNLOCK();
-        if (!b[0]) snprintf(b, sizeof b, "-- FPS");
-        const float x = px * 0.6f, y = px * 0.5f, w = text_w(f, b);
-        rect(&o, x - px * 0.4f, y - px * 0.15f, x + w + px * 0.4f, y + lh + px * 0.1f, rgba(0, 0, 0, 150));
-        text(&o, x, y, b, rgba(255, 230, 120, 255));
-    }
+    if (opt.fps && !s_open) racit_perf_overlay(&o, f);
     if (!s_open) { tr_popup(&o, sw, sh); return o.n; }
 
     /* Dim the game, then a centred panel. */
@@ -2175,6 +2177,7 @@ void rsx_host_ui_options(rsx_host_options* out)
     *out = s_opt;
     if (!out->ds_plus) out->ds_speaker = out->ds_haptics = out->ds_triggers = out->ds_swap = out->ds_lightbar = out->ds_motion = 0;
 }
+void rsx_host_ui_flush_settings(void) {}
 void rsx_host_ui_attach(struct SDL_Window* w, float a, float r) { (void)w; (void)a; (void)r; }
 void rsx_host_ui_initial_window(int* w, int* h, unsigned* f) { *w = 1280; *h = 720; *f = 0; }
 int  rsx_host_ui_event(const union SDL_Event* e) { (void)e; return 0; }
