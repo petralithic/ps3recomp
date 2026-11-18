@@ -8,6 +8,7 @@
 #include "../platform/ps3_dev_flash.h"
 #include <string.h>
 #include <stdio.h>
+extern void racit_menu_archive_path(char* path, size_t capacity, int read_only);
 #include <stdlib.h>
 #include <errno.h>
 #include <sys/types.h>
@@ -341,6 +342,8 @@ int64_t sys_fs_open(ppu_context* ctx)
     const char* ps3_path = (const char*)vm_to_host(path_addr);
     char host_path[1024];
     sys_fs_translate_path(ps3_path, host_path, sizeof(host_path));
+    racit_menu_archive_path(host_path, sizeof host_path,
+        (flags & (CELL_FS_O_ACCMODE | CELL_FS_O_CREAT | CELL_FS_O_TRUNC | CELL_FS_O_APPEND)) == CELL_FS_O_RDONLY);
 
     /* racacit: RACACIT_SKIP_MOVIES=1 -- every pre-rendered (Bink) movie is
      * skipped: report the .bik as absent and the title plays on exactly as it

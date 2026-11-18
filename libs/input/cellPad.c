@@ -1245,9 +1245,9 @@ static const struct { const char* name; u16 btn; const char* def; } k_kb[KB_N] =
     { "CIRCLE",   CELL_PAD_CTRL_CIRCLE,   "E,Backspace" },
     { "SQUARE",   CELL_PAD_CTRL_SQUARE,   "F" },
     { "TRIANGLE", CELL_PAD_CTRL_TRIANGLE, "Q" },
-    { "L1",       CELL_PAD_CTRL_L1,       "Mouse3" },          /* strafe / aim (right mouse button) */
+    { "L1",       CELL_PAD_CTRL_L1,       "Left Ctrl" },          /* Left Ctrl */
     { "R1",       CELL_PAD_CTRL_R1,       "Mouse1" },          /* fire (left mouse button) */
-    { "L2",       CELL_PAD_CTRL_L2,       "Left Ctrl" },
+    { "L2",       CELL_PAD_CTRL_L2,       "Mouse3" },
     { "R2",       CELL_PAD_CTRL_R2,       "Left Shift" },
     { "L3",       CELL_PAD_CTRL_L3,       "V" },
     { "R3",       CELL_PAD_CTRL_R3,       "Mouse2,B" },        /* middle mouse button */
@@ -1270,6 +1270,8 @@ static const struct { const char* name; u16 btn; const char* def; } k_kb[KB_N] =
 /* An input: a scancode (< 512), or 512 + mouse button 1-5, or 520/521 the wheel. */
 #define KB_MAX_KEYS 4
 static int s_kb_keys[KB_N][KB_MAX_KEYS];
+static SDL_atomic_t s_racit_keyboard_prompts = {1};
+int racit_keyboard_prompts_active(void) { return SDL_AtomicGet(&s_racit_keyboard_prompts); }
 static int s_kbm_on = -1;             /* allowed this run (PAD_NO_KEYBOARD) */
 extern volatile int g_racacit_kbm_on;   /* rsx_host_ui.c: capture the mouse on a click */
 
@@ -1336,6 +1338,7 @@ static void pad_poll_kbm(int ignore_real)
     hs->connected = 1;   /* with no controller the keyboard is the pad (pad_poll_sdl2 left it neutral) */
     u16 btns = 0;
     for (int k = 0; k < KB_N; k++) if (held[k] && k_kb[k].btn) btns |= k_kb[k].btn;
+    if (btns || dx || dy || wheel || mb || held[KB_LS_UP] || held[KB_LS_DOWN] || held[KB_LS_LEFT] || held[KB_LS_RIGHT]) SDL_AtomicSet(&s_racit_keyboard_prompts,1);
     hs->buttons |= btns;
     if (btns & CELL_PAD_CTRL_L2) hs->trigger_l2 = 255;
     if (btns & CELL_PAD_CTRL_R2) hs->trigger_r2 = 255;
@@ -1360,26 +1363,18 @@ static void pad_poll_kbm(int ignore_real)
      * a slow move still turns; smoothed over a few polls (mouse reports come
      * in bursts). */
     {
-        static Uint64 last; static float sx, sy;
-        const Uint64 now = SDL_GetPerformanceCounter();
-        float dt = last ? (float)((double)(now - last) * 1000.0 / (double)SDL_GetPerformanceFrequency()) : 16.0f;   /* ms */
-        last = now;
-        if (dt < 1.0f) dt = 1.0f;
-        if (dt > 50.0f) dt = 50.0f;
-        float vx = 0.0f, vy = 0.0f;
-        if (captured && (dx || dy)) {
-            const float k = 0.11f * (float)opt.mouse_sens / 100.0f, dz = 0.22f;
-            float ax = fabsf((float)dx) / dt * k, ay = fabsf((float)dy) / dt * k;
-            if (ax > 0.0f) ax = dz + (1.0f - dz) * (ax > 1.0f ? 1.0f : ax);
-            if (ay > 0.0f) ay = dz + (1.0f - dz) * (ay > 1.0f ? 1.0f : ay);
-            vx = dx < 0 ? -ax : ax; vy = dy < 0 ? -ay : ay;
-            if (opt.mouse_invert) vy = -vy;
-        }
-        sx += (vx - sx) * 0.6f; sy += (vy - sy) * 0.6f;
-        if (fabsf(sx) < 0.02f) sx = 0.0f;
-        if (fabsf(sy) < 0.02f) sy = 0.0f;
-        float rx = sx, ry = sy;
+        struct RacitMouseState { uint64_t epoch_ns; int64_t dx,dy; float x,y; };
+        extern void racit_mouse_step(struct RacitMouseState*,uint64_t,int,int,int,float,int);
+        extern void racit_camera_feed(uint64_t,int,int,int,float,int);
+        extern int racit_camera_follow_active(uint64_t);
+        static struct RacitMouseState motion;
+        const uint64_t now_ns=(uint64_t)((double)SDL_GetPerformanceCounter()*1000000000.0/(double)SDL_GetPerformanceFrequency());
+        racit_mouse_step(&motion,now_ns,dx,dy,captured,(float)opt.mouse_sens,opt.mouse_invert);
+        racit_camera_feed(now_ns,dx,dy,captured,(float)opt.mouse_sens,opt.mouse_invert);
+        const int direct_follow=racit_camera_follow_active(now_ns);
+        float rx=direct_follow ? 0.0f : motion.x, ry=direct_follow ? 0.0f : motion.y;
         const float kx = (float)(held[KB_RS_RIGHT] - held[KB_RS_LEFT]), ky = (float)(held[KB_RS_DOWN] - held[KB_RS_UP]);
+        if (kx || ky) racit_camera_feed(now_ns,0,0,0,(float)opt.mouse_sens,opt.mouse_invert);
         if (!rx && !ry && (kx || ky)) { rx = kx * 0.8f; ry = ky * 0.8f; }
         if (rx || ry) {
             hs->analog_rx = (u8)(128.0f + 127.0f * (rx > 1.0f ? 1.0f : rx < -1.0f ? -1.0f : rx));
@@ -1481,6 +1476,7 @@ static void pad_init_backend(void)
     memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) s_sdl_ids[p] = -1;
     pad_sdl_attach();
+    SDL_AtomicSet(&s_racit_keyboard_prompts, s_sdl_controllers[0] == NULL);
 }
 
 static void pad_shutdown_backend(void)
@@ -1612,6 +1608,12 @@ static void pad_poll_backend(void)
           s_host_state[i].sensor_x = s_host_state[i].sensor_y = s_host_state[i].sensor_z = s_host_state[i].sensor_g = 512;
       } }
 #if PAD_BACKEND_SDL2
+    if (!ign) {
+        const PadHostState* h = &s_host_state[0];
+        if (h->connected && (h->buttons || h->analog_lx < 100 || h->analog_lx > 156 ||
+            h->analog_ly < 100 || h->analog_ly > 156 || h->analog_rx < 100 || h->analog_rx > 156 ||
+            h->analog_ry < 100 || h->analog_ry > 156)) SDL_AtomicSet(&s_racit_keyboard_prompts,0);
+    }
     pad_poll_kbm(ign);
 #endif
     pad_note_human();

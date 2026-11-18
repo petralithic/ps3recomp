@@ -1171,6 +1171,9 @@ static void audio_mix_loop(void)
     printf("[cellAudio] Mixing thread started\n");
     /* It carries the clock the game's synth runs on (audio_pub_tick) and does
      * little else: a late wake here is a late read index for the whole game. */
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
 #if AUDIO_BACKEND_SDL2
     ast_init(&s_st);
 #endif

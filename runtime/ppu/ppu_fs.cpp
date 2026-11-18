@@ -28,6 +28,7 @@
 #include <vector>
 #include <stdint.h>
 #include <stdio.h>
+extern "C" void racit_menu_archive_path(char* path, size_t capacity, int read_only);
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -335,6 +336,8 @@ static void cellFsOpen(ppu_context* ctx)
     uint32_t flags  = (uint32_t)ctx->gpr[4];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
+    racit_menu_archive_path(hpath, sizeof hpath,
+        (flags & (3u | CELL_FS_O_CREAT | CELL_FS_O_TRUNC | CELL_FS_O_APPEND)) == CELL_FS_O_RDONLY);
 
     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
      * file and that is opened in its place. */

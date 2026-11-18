@@ -5761,7 +5761,10 @@ static int vk_ap_queue(u32 pipe_index, u32 t, VkRenderPass rp)
     }
     SDL_LockMutex(s_ap.mu);
     const int ok = s_ap.tail - s_ap.head < VK_AP_QUEUE;
-    if (ok) { SDL_AtomicAdd(&s_ap.active, 1);
+    if (ok) { vk_eng_pipe* P = &s_epipe[pipe_index];
+              P->skipped[t] = 1; P->build_ms[t] = 0;
+              SDL_AtomicSet(&P->pend[t], 1);
+              SDL_AtomicAdd(&s_ap.active, 1);
               s_ap.q[s_ap.tail % VK_AP_QUEUE].pipe = pipe_index; s_ap.q[s_ap.tail % VK_AP_QUEUE].topo = t;
               s_ap.q[s_ap.tail % VK_AP_QUEUE].rp = rp; s_ap.tail++; SDL_CondSignal(s_ap.cv); }
     SDL_UnlockMutex(s_ap.mu);
@@ -5808,8 +5811,6 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
      * stall behind a 164 ms compile). The new one joins the queue; a cached
      * one is made there within a frame or two. */
     if (s_vk_pcc && s_ap.th && SDL_AtomicGet(&s_ap.active) > 0 && vk_ap_queue((u32)(P - s_epipe), topo_idx, rp)) {
-        P->skipped[topo_idx] = 1; P->build_ms[topo_idx] = 0;
-        SDL_AtomicSet(&P->pend[topo_idx], 1);
         return VK_NULL_HANDLE;
     }
     if (s_vk_pcc && !s_ap.off) {
@@ -5823,8 +5824,6 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         }
         P->variant[topo_idx] = VK_NULL_HANDLE;
         if (rc == VK_PIPELINE_COMPILE_REQUIRED_EXT && vk_ap_queue((u32)(P - s_epipe), topo_idx, rp)) {
-            P->skipped[topo_idx] = 1; P->build_ms[topo_idx] = 0;
-            SDL_AtomicSet(&P->pend[topo_idx], 1);
             return VK_NULL_HANDLE;
         }
     }

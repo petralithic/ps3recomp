@@ -9,6 +9,7 @@
 #include "../../runtime/platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/endian.h"
 #include <stdio.h>
+extern void racit_menu_archive_path(char* path, size_t capacity, int read_only);
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -452,6 +453,9 @@ s32 cellFsOpen(const char* path, s32 flags, CellFsFd* fd, const void* arg, u64 s
         printf("[cellFs] Open: no path mapping for '%s'\n", gpath(path));
         return (s32)CELL_ENOENT;
     }
+
+    racit_menu_archive_path(host_path, sizeof host_path,
+        (flags & (CELL_FS_O_ACCMODE | CELL_FS_O_CREAT | CELL_FS_O_TRUNC | CELL_FS_O_APPEND)) == CELL_FS_O_RDONLY);
 
     /* If creating, ensure parent directories exist */
     if (flags & CELL_FS_O_CREAT) {
