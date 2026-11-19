@@ -2242,6 +2242,9 @@ static void vk_shaders_state(const char* what)
     fclose(f);
 }
 static SDL_atomic_t s_pw_dirty;          /* the pre-warm built pipelines: save the cache */
+static void* s_pw_blob; static size_t s_pw_blob_n;   /* vk_prewarm_thread */
+static VkPipelineCache s_pw_cache[8];      /* the pre-warm workers' own (keep mode) */
+static volatile int s_pw_merge;            /* 1: the workers are done, their caches wait for vk_ap_merge */
 /* macOS: MoltenVK's pipeline cache holds MSL, and creating a cache from a
  * file compiles every Metal library in it, one after another, before
  * vkCreatePipelineCache returns: 53 s for a 15 MB file on an M1 Pro, on the
@@ -2314,7 +2317,8 @@ static void vk_pcache_init(void)
         }
     }
     vk_shaders_state(n == 0 ? "empty" : rebuild ? "refused" : "ok");
-    free(data);
+    if (n && data) { s_pw_blob = data; s_pw_blob_n = n; }   /* the pre-warm's caches start from it (vk_plist_open frees it otherwise) */
+    else free(data);
     { const char* s = getenv("RSX_PIPELINE_SALT"); s_g.pcache_salt = s ? (u32)strtoul(s, NULL, 0) : 0u; }
     if (s_g.pcache) vk_plist_open(rebuild);                  /* and the pre-warm, if needed */
     vk_prog_open();
@@ -4974,6 +4978,14 @@ static struct {
  * destination, so not while the pre-warm builds into it. */
 static void vk_ap_merge(void)
 {
+    if (s_pw_merge == 1) {                     /* render thread: the only user of the main cache */
+        SDL_MemoryBarrierAcquire();
+        u32 m = 0;
+        for (u32 i = 0; i < 8; i++) if (s_pw_cache[i]) s_pw_cache[m++] = s_pw_cache[i];
+        if (m && pvkMergePipelineCaches(s_vk.device, s_g.pcache, m, s_pw_cache) == VK_SUCCESS) s_g.pcache_dirty++;
+        for (u32 i = 0; i < m; i++) { pvkDestroyPipelineCache(s_vk.device, s_pw_cache[i], NULL); s_pw_cache[i] = VK_NULL_HANDLE; }
+        s_pw_merge = 2;
+    }
     if (!s_ap.cache || s_ap.merged == s_ap.built || s_pw_running) return;
     if (pvkMergePipelineCaches(s_vk.device, s_g.pcache, 1, &s_ap.cache) == VK_SUCCESS) s_ap.merged = s_ap.built;
 }
@@ -5796,14 +5808,112 @@ static VkShaderModule vk_pw_module(FILE* f, const vk_pw_spv* s, u32* buf)
     return pvkCreateShaderModule(s_vk.device, &ci, NULL, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
+/* RSX_PIPELINE_PREWARM=keep (the default on macOS): the pre-warm runs at
+ * every start that has a list, on RSX_PIPELINE_PREWARM_THREADS threads
+ * (default 3), each with a pipeline cache of its own made from the loaded
+ * file, and keeps what it builds: the draw that first needs a listed variant
+ * takes it from s_pwk instead of building it on the render thread (mid-play
+ * that was a 20 ms-1.6 s hitch per new pipeline on Apple Silicon: MoltenVK
+ * compiles the Metal library even for a pipeline-cache hit). A variant a
+ * worker is building is waited for; one no worker has started is built by
+ * the draw as before. The workers' caches are merged into the main one
+ * (vk_ap_merge) once they are all done. */
+typedef struct { u64 key; VkPipeline pipe; SDL_atomic_t st; } vk_pwk;   /* st: 0 listed, 1 building, 2 ready, 3 none, 4 taken */
+static vk_pwk* s_pwk;
+static u32 s_pwk_cap;
+static int s_pw_keep;
+static SDL_atomic_t s_pw_next, s_pw_built, s_pw_failed, s_pw_absent, s_pw_live;
+static u32 s_pw_taken;                 /* render thread: kept pipelines its draws took */
+static SDL_atomic_t s_pw_urgent;        /* the render thread is building or waiting for a pipeline */
+static struct { vk_pw_spv* sp; u32 ns; unsigned long long t0; } s_pwj;
+
+static vk_pwk* vk_pwk_find(u64 key)
+{
+    if (!s_pwk) return NULL;
+    for (u32 j = (u32)(key ^ (key >> 32)) & (s_pwk_cap - 1u); s_pwk[j].key; j = (j + 1u) & (s_pwk_cap - 1u))
+        if (s_pwk[j].key == key) return &s_pwk[j];
+    return NULL;
+}
+
+/* One worker: list records by a shared index, each built once. */
+static int SDLCALL vk_prewarm_worker(void* arg)
+{
+    const u32 wi = (u32)(uintptr_t)arg;
+    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
+    const char* path = getenv("RSX_SHADER_CACHE");
+    FILE* f = (path && *path) ? fopen(path, "rb") : NULL;
+    u32* buf = (u32*)malloc(VK_SPV_WORDS * sizeof *buf);
+    VkPipelineCache pc = s_pw_keep ? s_pw_cache[wi] : s_g.pcache;
+    VkRenderPass rp[2][RSX_BE_MAX_COLOR_TARGETS + 1];
+    memset(rp, 0, sizeof rp);
+    VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
+    const vk_pw_spv* vcur = NULL;
+    const vk_pw_spv* fcur = NULL;
+    unsigned long long tlog = ps3_qpc_us();
+    const vk_vdesc* recs = s_pw.recs;
+    const u32 n = s_pw.n;
+    while (f && buf && pc && !SDL_AtomicGet(&s_pw.stop)) {
+        /* A draw is waiting for a pipeline: Metal's compiler is the draw's
+         * now (it takes compiles in turn, and a queue of pre-warm builds ahead
+         * of the draw's held the frame for seconds). */
+        while ((SDL_AtomicGet(&s_pw_urgent) > 0 || SDL_AtomicGet(&s_ap.active) > 0) && !SDL_AtomicGet(&s_pw.stop)) SDL_Delay(2);
+        const u32 i = (u32)SDL_AtomicAdd(&s_pw_next, 1);
+        if (i >= n) break;
+        const vk_vdesc* d = &recs[i];
+        vk_pwk* k = s_pw_keep ? vk_pwk_find(vk_vdesc_key(d)) : NULL;
+        if (k && !SDL_AtomicCAS(&k->st, 0, 1)) continue;       /* the render thread took it */
+        const vk_pw_spv* vs = vk_pw_find(s_pwj.sp, s_pwj.ns, d->vs_hash, d->vs_words);
+        const vk_pw_spv* fs = vk_pw_find(s_pwj.sp, s_pwj.ns, d->fs_hash, d->fs_words);
+        VkPipeline p = VK_NULL_HANDLE;
+        if (!vs || vs->off < 0 || !fs || fs->off < 0) {
+            SDL_AtomicAdd(&s_pw_absent, 1);
+        } else {
+            if (vs != vcur) { if (vm) pvkDestroyShaderModule(s_vk.device, vm, NULL); vm = vk_pw_module(f, vs, buf); vcur = vs; }
+            if (fs != fcur) { if (fm) pvkDestroyShaderModule(s_vk.device, fm, NULL); fm = vk_pw_module(f, fs, buf); fcur = fs; }
+            VkRenderPass* r = &rp[d->rt_fi][d->rt_count];
+            if (!*r) *r = vk_eng_make_render_pass(d->rt_count, d->rt_fi, 0);
+            if (!vm || !fm || !*r || vk_vdesc_build(d, vm, fm, *r, &p, 0, pc) != VK_SUCCESS) { p = VK_NULL_HANDLE; SDL_AtomicAdd(&s_pw_failed, 1); }
+        }
+        if (k) {
+            k->pipe = p;
+            SDL_MemoryBarrierRelease();
+            SDL_AtomicSet(&k->st, p ? 2 : 3);
+        } else if (p) pvkDestroyPipeline(s_vk.device, p, NULL);
+        if (p && ((u32)SDL_AtomicAdd(&s_pw_built, 1) & 63u) == 63u && !s_pw_keep) SDL_AtomicSet(&s_pw_dirty, 1);
+        const unsigned long long now = ps3_qpc_us();
+        if (wi == 0 && now - tlog >= 5000000ull) {
+            tlog = now;
+            VK_LOG("pipeline pre-warm: %d of %u built (%.1f s)\n", SDL_AtomicGet(&s_pw_built), n, (now - s_pwj.t0) / 1e6);
+        }
+    }
+    if (vm) pvkDestroyShaderModule(s_vk.device, vm, NULL);
+    if (fm) pvkDestroyShaderModule(s_vk.device, fm, NULL);
+    for (u32 fi = 0; fi < 2; fi++)
+        for (u32 c = 0; c <= RSX_BE_MAX_COLOR_TARGETS; c++)
+            if (rp[fi][c]) pvkDestroyRenderPass(s_vk.device, rp[fi][c], NULL);
+    if (f) fclose(f);
+    free(buf);
+    if (SDL_AtomicAdd(&s_pw_live, -1) == 1) {                    /* the last one out */
+        const int built = SDL_AtomicGet(&s_pw_built);
+        VK_LOG("pipeline pre-warm: %s, %d of %u variants built in %.1f s (%d without their programs, %d failed)\n",
+               SDL_AtomicGet(&s_pw.stop) ? "stopped" : "done", built, n, (ps3_qpc_us() - s_pwj.t0) / 1e6,
+               SDL_AtomicGet(&s_pw_absent), SDL_AtomicGet(&s_pw_failed));
+        if (built && !s_pw_keep) SDL_AtomicSet(&s_pw_dirty, 1);
+        if (built && !SDL_AtomicGet(&s_pw.stop)) vk_shaders_state("ok");
+        if (s_pw_keep) { SDL_MemoryBarrierRelease(); s_pw_merge = 1; }
+        s_pw_running = 0;
+    }
+    return 0;
+}
+
 static int SDLCALL vk_prewarm_thread(void* arg)
 {
     (void)arg;
     SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
-    const unsigned long long t0 = ps3_qpc_us();
+    s_pwj.t0 = ps3_qpc_us();
     const vk_vdesc* recs = s_pw.recs;
     const u32 n = s_pw.n;
-    u32 ns = 0, nw = 0, found = 0, built = 0, absent = 0, failed = 0;
+    u32 ns = 0, nw = 0, found = 0;
     vk_pw_spv* sp = (vk_pw_spv*)malloc((size_t)n * 2u * sizeof *sp);
     u32* wc  = (u32*)malloc((size_t)n * 2u * sizeof *wc);
     u32* buf = (u32*)malloc(VK_SPV_WORDS * sizeof *buf);
@@ -5823,56 +5933,45 @@ static int SDLCALL vk_prewarm_thread(void* arg)
         f = vk_pw_find_programs(sp, ns, wc, nw, buf, &found);
         if (!f) VK_LOG("pipeline pre-warm: no shader cache file to read the programs from\n");
     }
+    free(wc); free(buf);
+    u32 nth = 1;
     if (f) {
-        VK_LOG("pipeline pre-warm: %u of the %u programs found in the shader cache (%.1f s)\n",
-               found, ns, (ps3_qpc_us() - t0) / 1e6);
-        /* In list order (first seen first); a module carries over while
-         * consecutive records share it. */
-        VkRenderPass rp[2][RSX_BE_MAX_COLOR_TARGETS + 1];
-        memset(rp, 0, sizeof rp);
-        VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
-        const vk_pw_spv* vcur = NULL;
-        const vk_pw_spv* fcur = NULL;
-        unsigned long long tlog = ps3_qpc_us();
-        for (u32 i = 0; i < n && !SDL_AtomicGet(&s_pw.stop); i++) {
-            const vk_vdesc* d = &recs[i];
-            const vk_pw_spv* vs = vk_pw_find(sp, ns, d->vs_hash, d->vs_words);
-            const vk_pw_spv* fs = vk_pw_find(sp, ns, d->fs_hash, d->fs_words);
-            if (!vs || vs->off < 0 || !fs || fs->off < 0) { absent++; continue; }
-            if (vs != vcur) {
-                if (vm) pvkDestroyShaderModule(s_vk.device, vm, NULL);
-                vm = vk_pw_module(f, vs, buf); vcur = vs;
-            }
-            if (fs != fcur) {
-                if (fm) pvkDestroyShaderModule(s_vk.device, fm, NULL);
-                fm = vk_pw_module(f, fs, buf); fcur = fs;
-            }
-            VkRenderPass* r = &rp[d->rt_fi][d->rt_count];
-            if (!*r) *r = vk_eng_make_render_pass(d->rt_count, d->rt_fi, 0);
-            VkPipeline p = VK_NULL_HANDLE;
-            if (!vm || !fm || !*r || vk_vdesc_build(d, vm, fm, *r, &p, 0, s_g.pcache) != VK_SUCCESS) { failed++; continue; }
-            pvkDestroyPipeline(s_vk.device, p, NULL);
-            if ((++built & 63u) == 0) SDL_AtomicSet(&s_pw_dirty, 1);
-            const unsigned long long now = ps3_qpc_us();
-            if (now - tlog >= 5000000ull) {
-                tlog = now;
-                VK_LOG("pipeline pre-warm: %u of %u built (%.1f s)\n", built, n, (now - t0) / 1e6);
-            }
-        }
-        if (vm) pvkDestroyShaderModule(s_vk.device, vm, NULL);
-        if (fm) pvkDestroyShaderModule(s_vk.device, fm, NULL);
-        for (u32 fi = 0; fi < 2; fi++)
-            for (u32 c = 0; c <= RSX_BE_MAX_COLOR_TARGETS; c++)
-                if (rp[fi][c]) pvkDestroyRenderPass(s_vk.device, rp[fi][c], NULL);
         fclose(f);
+        VK_LOG("pipeline pre-warm: %u of the %u programs found in the shader cache (%.1f s)\n",
+               found, ns, (ps3_qpc_us() - s_pwj.t0) / 1e6);
+        s_pwj.sp = sp; s_pwj.ns = ns;
+        if (s_pw_keep) {
+            const char* e = getenv("RSX_PIPELINE_PREWARM_THREADS");
+            nth = e ? (u32)atoi(e) : 3u;
+            if (nth < 1) nth = 1;
+            if (nth > 8) nth = 8;
+            for (u32 i = 0; i < nth; i++) {
+                VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+                                                 .initialDataSize = s_pw_blob_n, .pInitialData = s_pw_blob_n ? s_pw_blob : NULL };
+                if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_pw_cache[i]) != VK_SUCCESS) {
+                    ci.initialDataSize = 0; ci.pInitialData = NULL;
+                    if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_pw_cache[i]) != VK_SUCCESS) s_pw_cache[i] = VK_NULL_HANDLE;
+                }
+            }
+            VK_LOG("pipeline pre-warm: %u variants on %u threads, kept for the draws\n", n, nth);
+        }
     }
-    VK_LOG("pipeline pre-warm: %s, %u of %u variants built in %.1f s (%u without their programs, %u failed)\n",
-           SDL_AtomicGet(&s_pw.stop) ? "stopped" : "done", built, n, (ps3_qpc_us() - t0) / 1e6, absent, failed);
-    if (built) SDL_AtomicSet(&s_pw_dirty, 1);
-    if (built && !SDL_AtomicGet(&s_pw.stop)) vk_shaders_state("ok");
-    free(sp); free(wc); free(buf);
+    free(s_pw_blob); s_pw_blob = NULL; s_pw_blob_n = 0;
+    SDL_Thread* extra[8] = { 0 };
+    SDL_AtomicSet(&s_pw_live, (int)nth);
+    if (f) {
+        for (u32 i = 1; i < nth; i++) {
+            extra[i] = SDL_CreateThread(vk_prewarm_worker, "pipeline-prewarm", (void*)(uintptr_t)i);
+            if (!extra[i]) SDL_AtomicAdd(&s_pw_live, -1);
+        }
+        vk_prewarm_worker((void*)(uintptr_t)0);
+        for (u32 i = 1; i < nth; i++) if (extra[i]) SDL_WaitThread(extra[i], NULL);
+    } else {
+        s_pw_running = 0;
+        if (s_pw_keep) for (u32 j = 0; j < s_pwk_cap; j++) if (s_pwk[j].key) SDL_AtomicCAS(&s_pwk[j].st, 0, 3);
+    }
+    free(sp); s_pwj.sp = NULL; s_pwj.ns = 0;
     free(s_pw.recs); s_pw.recs = NULL;
-    s_pw_running = 0;
     return 0;
 }
 
@@ -5947,7 +6046,26 @@ static void vk_plist_open(int rebuild)
         return;
     }
     const char* pw = getenv("RSX_PIPELINE_PREWARM");
+#ifdef __APPLE__
+    if (!pw || !*pw) pw = "keep";
+#endif
     if (pw && *pw) rebuild = pw[0] != '0';
+    s_pw_keep = rebuild && n && pw && !strcmp(pw, "keep");
+    if (s_pw_keep) {
+        u32 cap = 64; while (cap < 2u * n) cap *= 2u;
+        s_pwk = (vk_pwk*)calloc(cap, sizeof *s_pwk);
+        if (!s_pwk) s_pw_keep = 0;
+        else {
+            s_pwk_cap = cap;
+            for (u32 i = 0; i < n; i++) {
+                const u64 key = vk_vdesc_key(&recs[i]);
+                u32 j = (u32)(key ^ (key >> 32)) & (cap - 1u);
+                while (s_pwk[j].key && s_pwk[j].key != key) j = (j + 1u) & (cap - 1u);
+                s_pwk[j].key = key;
+            }
+        }
+    }
+    if (!s_pw_keep) { free(s_pw_blob); s_pw_blob = NULL; s_pw_blob_n = 0; }
     if (rebuild && n) {
         s_pw.recs = recs; s_pw.n = n;
         SDL_AtomicSet(&s_pw.stop, 0);
@@ -5972,6 +6090,11 @@ static void vk_plist_close(void)
         SDL_WaitThread(s_pw.thread, NULL);
         s_pw.thread = NULL;
     }
+    for (u32 j = 0; j < s_pwk_cap; j++)
+        if (s_pwk[j].pipe && SDL_AtomicGet(&s_pwk[j].st) == 2) pvkDestroyPipeline(s_vk.device, s_pwk[j].pipe, NULL);
+    free(s_pwk); s_pwk = NULL; s_pwk_cap = 0;
+    for (u32 i = 0; i < 8; i++) if (s_pw_cache[i]) { pvkDestroyPipelineCache(s_vk.device, s_pw_cache[i], NULL); s_pw_cache[i] = VK_NULL_HANDLE; }
+    free(s_pw_blob); s_pw_blob = NULL; s_pw_blob_n = 0;
     if (s_pl.f) fclose(s_pl.f);
     free(s_pl.seen);
     memset(&s_pl, 0, sizeof s_pl);
@@ -6451,7 +6574,16 @@ static void vk_ap_stop(void)
     s_ap.th = NULL; s_ap.off = 1;
 }
 
+static VkPipeline vk_eng_variant_make(vk_eng_pipe* P, u32 topo_idx);
 static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
+{
+    if (P->variant[topo_idx]) return P->variant[topo_idx];
+    SDL_AtomicAdd(&s_pw_urgent, 1);
+    const VkPipeline v = vk_eng_variant_make(P, topo_idx);
+    SDL_AtomicAdd(&s_pw_urgent, -1);
+    return v;
+}
+static VkPipeline vk_eng_variant_make(vk_eng_pipe* P, u32 topo_idx)
 {
     if (P->variant[topo_idx]) return P->variant[topo_idx];
     const int pend = SDL_AtomicGet(&P->pend[topo_idx]);
@@ -6476,6 +6608,19 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     vk_vdesc d;
     vk_vdesc_from(&d, P, k_vk_topo[topo_idx]);
     const unsigned long long _t0 = ps3_qpc_us();
+    /* Listed: the pre-warm's (keep mode), waited for while a worker builds it. */
+    vk_pwk* kw = s_pw_keep ? vk_pwk_find(vk_vdesc_key(&d)) : NULL;
+    if (kw && !SDL_AtomicCAS(&kw->st, 0, 4)) {
+        int st;
+        while ((st = SDL_AtomicGet(&kw->st)) == 1) { vk_keep_responsive(); SDL_Delay(1); }
+        if (st == 2 && SDL_AtomicCAS(&kw->st, 2, 4)) {
+            SDL_MemoryBarrierAcquire();
+            P->variant[topo_idx] = kw->pipe; kw->pipe = VK_NULL_HANDLE;
+            s_pw_taken++;
+            return P->variant[topo_idx];
+        }
+    }
+    vk_keep_responsive();
     /* While the builder compiles, the render thread makes no pipeline at all:
      * the driver runs one creation at a time, and even the quick cache check
      * below waited out a whole background compile (second test: a 166 ms
@@ -6503,7 +6648,6 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     { static int on = -1; if (on < 0) { const char* e = getenv("RACACIT_LOAD_STATS"); on = e && *e == '1'; }
       const unsigned long long us = ps3_qpc_us() - _t0;
       if (on && us >= 20000) VK_LOG("[pipe-slow] render-thread pipeline build %.1f ms\n", us / 1e3); }
-    vk_keep_responsive();
     s_g.pcache_dirty++;
     if (r != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
@@ -7409,6 +7553,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
 
 #ifdef __APPLE__
+    /* Metal compiles a pipeline's shaders on as many threads as it has: the
+     * pre-warm builds on several (vk_prewarm_thread). */
+    setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
     if (vk_load_library()) return -1;
 #endif
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
