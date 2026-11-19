@@ -353,6 +353,10 @@ static int vk_load_wsi_device_functions(void)
  * beyond VK_ERROR_DEVICE_LOST. */
 static PFN_vkGetDeviceFaultInfoEXT pvkGetDeviceFaultInfoEXT;
 static int s_vk_pcc;   /* VK_EXT_pipeline_creation_cache_control on: vk_eng_variant compiles new pipelines in the background */
+/* macOS: the thread that owns the window (the process main thread) pumps
+ * events from inside long work too -- renderer init, pipeline builds -- so
+ * the window server never sees it stop answering (the beach ball). */
+static void vk_keep_responsive(void);
 static void vk_device_lost_report(VkResult r)
 {
     static int done;
@@ -2238,11 +2242,34 @@ static void vk_shaders_state(const char* what)
     fclose(f);
 }
 static SDL_atomic_t s_pw_dirty;          /* the pre-warm built pipelines: save the cache */
+/* macOS: MoltenVK's pipeline cache holds MSL, and creating a cache from a
+ * file compiles every Metal library in it, one after another, before
+ * vkCreatePipelineCache returns: 53 s for a 15 MB file on an M1 Pro, on the
+ * window's thread (the beach ball at every start, growing as the file
+ * grows). So on macOS the file is neither loaded nor saved unless
+ * RSX_PIPELINE_CACHE_LOAD=1; the pre-warm builds the listed variants from
+ * RSX_PIPELINE_LIST on background threads instead (vk_prewarm_thread). */
+static int vk_pcache_file_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("RSX_PIPELINE_CACHE_LOAD");
+#ifdef __APPLE__
+        on = e && *e == '1';
+#else
+        on = !(e && *e == '0');
+#endif
+    }
+    return on;
+}
+
 static void vk_pcache_init(void)
 {
     const char* path = getenv("RSX_PIPELINE_CACHE");
     void* data = NULL; size_t n = 0;
-    if (path && *path) {
+    if (path && *path && !vk_pcache_file_on())
+        VK_LOG("pipeline cache: %s not loaded (RSX_PIPELINE_CACHE_LOAD=1 loads it; MoltenVK compiles all of it up front)\n", path);
+    if (path && *path && vk_pcache_file_on()) {
         FILE* f = fopen(path, "rb");
         if (f) {
             fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
@@ -2261,6 +2288,7 @@ static void vk_pcache_init(void)
             fclose(f);
         }
     }
+    vk_keep_responsive();
     VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
                                      .initialDataSize = n, .pInitialData = n ? data : NULL };
     int rebuild = n == 0;                                    /* nothing to start from */
@@ -2270,7 +2298,7 @@ static void vk_pcache_init(void)
         if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_g.pcache) != VK_SUCCESS)
             s_g.pcache = VK_NULL_HANDLE;
     }
-    if (path && *path) VK_LOG("pipeline cache: %s, %zu bytes loaded\n", path, n);
+    if (path && *path && vk_pcache_file_on()) VK_LOG("pipeline cache: %s, %zu bytes loaded\n", path, n);
     /* The header names the driver that built it (32 bytes: size, version,
      * vendor, device, pipelineCacheUUID); a driver update changes the UUID and
      * the driver then ignores the whole file without a word -- every pipeline
@@ -2329,7 +2357,7 @@ static void vk_pcache_save(int force)
     static const char* path = (const char*)-1;
     if (path == (const char*)-1) path = getenv("RSX_PIPELINE_CACHE");
     if (SDL_AtomicSet(&s_pw_dirty, 0)) s_g.pcache_dirty++;
-    if (!s_g.pcache || !s_g.pcache_dirty || !path || !*path) return;
+    if (!s_g.pcache || !s_g.pcache_dirty || !path || !*path || !vk_pcache_file_on()) return;
     const unsigned long long now = ps3_qpc_us();
     if (!force && now - s_last < 5000000ull) return;      /* batch a burst of builds */
     if (!SDL_AtomicCAS(&s_pcache_busy, 0, 1)) return;     /* one save at a time */
@@ -6472,6 +6500,10 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     }
     const VkResult r = vk_vdesc_build(&d, P->vs, P->fs, rp, &P->variant[topo_idx], 0, s_g.pcache);
     s_vkt_var++; s_vkt_var_us += ps3_qpc_us() - _t0;
+    { static int on = -1; if (on < 0) { const char* e = getenv("RACACIT_LOAD_STATS"); on = e && *e == '1'; }
+      const unsigned long long us = ps3_qpc_us() - _t0;
+      if (on && us >= 20000) VK_LOG("[pipe-slow] render-thread pipeline build %.1f ms\n", us / 1e3); }
+    vk_keep_responsive();
     s_g.pcache_dirty++;
     if (r != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
@@ -7380,6 +7412,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     if (vk_load_library()) return -1;
 #endif
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
+    vk_keep_responsive();
     /* The window opened at the guest's size; the image the frame is composed
      * in follows the internal resolution, so a higher one reaches the screen
      * (the swapchain blit fits it to the window). */
@@ -7455,6 +7488,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
             vk_window_drop(why);
         }
     }
+    vk_keep_responsive();
     if (vk_pick_device()) {
         if (!s_vk.windowed) return -1;
         vk_window_drop("no device can present to the window");
@@ -7586,6 +7620,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                               VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return -1;
     if (vk_create_render_pass()) return -1;
     if (vk_create_pipeline_objects()) return -1;
+    vk_keep_responsive();
     if (vk_guest_init()) {
         VK_LOG("guest programs: setup failed, fixed-function path only\n");
         vk_guest_shutdown();
@@ -7606,6 +7641,7 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     pvkCmdClearColorImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &cr);
     pvkCmdClearDepthStencilImage(s_vk.cmd, s_vk.depth.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &dr);
     if (vk_submit_and_wait()) return -1;
+    vk_keep_responsive();
 
     if (s_vk.windowed) {
         VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
@@ -7616,9 +7652,43 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     return 0;
 }
 
+#ifdef __APPLE__
+#include <pthread.h>
+static unsigned long long s_vk_pump_us;   /* the window thread's last event pump */
+static pthread_t s_vk_event_thread;
+static int s_vk_event_thread_set;
+/* RACACIT_LOAD_STATS=1: every 100 ms or more the window thread went without
+ * pumping events, with the longest so far. */
+static void vk_pump_mark(unsigned long long now)
+{
+    static int on = -1; static double worst;
+    if (on < 0) { const char* e = getenv("RACACIT_LOAD_STATS"); on = e && *e == '1'; }
+    if (on && s_vk_pump_us && now - s_vk_pump_us >= 100000) {
+        const double ms = (now - s_vk_pump_us) / 1e3;
+        if (ms > worst) worst = ms;
+        VK_LOG("[pump-gap] %.0f ms without pumping events (longest %.0f)\n", ms, worst);
+    }
+    s_vk_pump_us = now;
+}
+static void vk_keep_responsive(void)
+{
+    if (!s_vk_event_thread_set || !pthread_equal(pthread_self(), s_vk_event_thread)) return;
+    const unsigned long long now = ps3_qpc_us();
+    if (now - s_vk_pump_us < 50000) return;
+    vk_pump_mark(now);
+    if (s_vk.window) SDL_PumpEvents();   /* queued for the frame loop's SDL_PollEvent */
+}
+#else
+static void vk_keep_responsive(void) { }
+#endif
+
 int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 {
     memset(&s_vk, 0, sizeof s_vk);
+#ifdef __APPLE__
+    s_vk_event_thread = pthread_self(); s_vk_event_thread_set = 1;
+    s_vk_pump_us = ps3_qpc_us();
+#endif
     if (vk_init_all(width, height, title)) {
         rsx_vulkan_backend_shutdown();
         return -1;
@@ -7696,6 +7766,9 @@ void rsx_vulkan_backend_shutdown(void)
 
 int rsx_vulkan_backend_pump_messages(void)
 {
+#ifdef __APPLE__
+    if (s_vk_event_thread_set && pthread_equal(pthread_self(), s_vk_event_thread)) vk_pump_mark(ps3_qpc_us());
+#endif
     if (!s_vk.windowed) return 0;
     int quit = 0;
     SDL_Event e;
