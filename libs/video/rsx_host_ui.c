@@ -247,6 +247,12 @@ static void settings_save(void)
     settings_save_file();
     SDL_AtomicUnlock(&save_lock);
 }
+/* Write pending settings now (the menu's Restart, game/restart.cpp). */
+void rsx_host_ui_flush_settings(void)
+{
+    if (s_dirty_ms) { settings_save(); s_dirty_ms = 0; }
+}
+
 static void settings_save_file(void)
 {
     const char* path = getenv("RACACIT_SETTINGS_FILE");
@@ -2268,6 +2274,7 @@ void rsx_host_ui_options(rsx_host_options* out)
     *out = s_opt;
     if (!out->ds_plus) out->ds_speaker = out->ds_haptics = out->ds_triggers = out->ds_swap = out->ds_lightbar = out->ds_motion = 0;
 }
+void rsx_host_ui_flush_settings(void) {}
 void rsx_host_ui_attach(struct SDL_Window* w, float a, float r) { (void)w; (void)a; (void)r; }
 void rsx_host_ui_initial_window(int* w, int* h, unsigned* f) { *w = 1280; *h = 720; *f = 0; }
 int  rsx_host_ui_event(const union SDL_Event* e) { (void)e; return 0; }

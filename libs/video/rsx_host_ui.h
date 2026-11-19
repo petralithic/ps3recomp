@@ -111,6 +111,8 @@ void rsx_host_ui_set_armor_look(int look);   /* the Skins menu's armor entries; 
  * `res_scale_active`: the internal resolution this run uses. */
 struct SDL_Window;
 void rsx_host_ui_attach(struct SDL_Window* win, float max_aniso, float res_scale_active);
+/* Write settings changed in the last second now, before a restart exits. */
+void rsx_host_ui_flush_settings(void);
 
 /* Initial window size and flags the backend should create the window with. */
 void rsx_host_ui_initial_window(int* w, int* h, unsigned* sdl_flags);

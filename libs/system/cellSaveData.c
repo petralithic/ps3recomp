@@ -1170,7 +1170,7 @@ static s32 savedata_execute_run(const char* dirName, int is_save,
                                 CellSaveDataFileCallback funcFile,
                                 void* userdata);
 
-static s32 savedata_execute(const char* dirName, int is_save,
+static s32 savedata_execute_impl(const char* dirName, int is_save,
                              CellSaveDataSetBuf* setBuf,
                              CellSaveDataStatCallback funcStat,
                              CellSaveDataFileCallback funcFile,
@@ -1326,6 +1326,23 @@ static s32 savedata_execute_run(const char* dirName, int is_save,
 /* ---------------------------------------------------------------------------
  * API implementations
  * -----------------------------------------------------------------------*/
+
+/* racacit: the menu's Restart (game/restart.cpp) waits for every save or load
+ * in flight, and none starts once it is requested. The gate covers every
+ * return of the complete transaction. */
+extern int racit_restart_save_begin(void);
+extern void racit_restart_save_end(void);
+static s32 savedata_execute(const char* dirName, int is_save,
+                            CellSaveDataSetBuf* setBuf,
+                            CellSaveDataStatCallback funcStat,
+                            CellSaveDataFileCallback funcFile,
+                            void* userdata)
+{
+    if (!racit_restart_save_begin()) return CELL_SAVEDATA_ERROR_BUSY;
+    const s32 result = savedata_execute_impl(dirName, is_save, setBuf, funcStat, funcFile, userdata);
+    racit_restart_save_end();
+    return result;
+}
 
 /* The list save/load utilities are a system UI on hardware: they take a
  * second or more. Done instantly, A Crack in Time's New Game never moved
