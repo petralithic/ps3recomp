@@ -1149,6 +1149,13 @@ static int eng_surface_retire(u32 slot)
                 s->location, s->offset, s->w, s->h, swz ? " swizzled" : "", age, n_ret, 10);
     if (why) { eng_retired_note(s, span ? span : s->w * s->h * 4u, why); return 0; }
     if (rsx_ww_on() && rsx_ww_guest_written_since(dst, span, s->ww_epoch)) { n_skip++; return 0; }
+    /* Without the write watch (macOS, or RACACIT_NO_WRITE_WATCH) the engine
+     * cannot tell whether the game has reused this memory since the target
+     * was drawn. In main memory the game recycles such ranges for other data
+     * (SPU job code and buffers among it), and writing stale pixels over them
+     * hung Zolar Forest: an SPU job then branched into the pixels. Leave main
+     * memory alone; local (video) memory only ever holds graphics. */
+    if (!rsx_ww_on() && s->location == 1) { n_skip++; return 0; }
     u8* px = (u8*)malloc((size_t)s->w * s->h * 4u);
     if (!px) return -1;
     /* A failed readback writes nothing: the buffer is not pixels. */
