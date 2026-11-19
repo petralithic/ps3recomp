@@ -147,6 +147,15 @@ u32 rsx_swizzle_offset_3d(u32 x, u32 y, u32 z, u32 log2w, u32 log2h, u32 log2d);
 /* ceil(log2(v)); 0 for v <= 1. */
 u32 rsx_log2_ceil(u32 v);
 
+/* The uncompressed part of rsx_texture_decode two ways, same output: texel by
+ * texel (the reference), and with per-level offset tables and a 32-bit ARGB
+ * fast path (w, h <= 4096). rsx_texture_decode picks the fast one unless
+ * RSX_TEX_DECODE_SLOW=1. Exposed for tests/test_rsx_texture_decode_fast.c. */
+void rsx_texture_decode_slow(void* dst, u32 dst_pitch, const u8* src, u32 w, u32 h,
+                             const rsx_tex_layout* tl, int argb_as_rgba);
+void rsx_texture_decode_fast(void* dst, u32 dst_pitch, const u8* src, u32 w, u32 h,
+                             const rsx_tex_layout* tl, int argb_as_rgba);
+
 /* Convert one face/level of a guest texture into host-ready rows.
  *
  *   dst       destination, at least dst_pitch * tl->rows bytes

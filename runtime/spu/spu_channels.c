@@ -719,7 +719,7 @@ found:
 #ifdef _WIN32
         SwitchToThread();
 #else
-        { extern void racacit_yield(void); racacit_yield(); }
+        sched_yield();
 #endif
         return;
     }
@@ -4329,7 +4329,8 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt)
 
 #ifdef __cplusplus
 }
-#endif/* racacit: see spu_ls_write128. Names the lifted function (by its LS entry
+#endif
+/* racacit: see spu_ls_write128. Names the lifted function (by its LS entry
  * and image) whose code issued the store, from the caller's host address:
  * the registry entry with the nearest host start at or below it. */
 __attribute__((noinline)) void spu_ls_fill_guard(spu_context* ctx, uint32_t lsa)
@@ -4356,11 +4357,6 @@ static _Thread_local struct { uint32_t cmd, lsa, ea, size; } s_dring[128];
 static _Thread_local uint32_t s_dring_i;
 void spu_dma_ring_note(uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size)
 {
-    /* Every SPU transfer lands here, and on macOS each thread-local access is
-     * a _tlv_get_addr call: keep the ring only when asked, SPU_DMA_RING=1. */
-    static int s_on = -1;
-    if (__builtin_expect(s_on < 0, 0)) s_on = getenv("SPU_DMA_RING") ? 1 : 0;
-    if (!s_on) return;
     const uint32_t k = s_dring_i++ & 127u;
     s_dring[k].cmd = cmd; s_dring[k].lsa = lsa; s_dring[k].ea = ea; s_dring[k].size = size;
 }

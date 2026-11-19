@@ -90,85 +90,9 @@ void spu_spin_wait(volatile long* lock)
 }
 #else
 #include <stdatomic.h>
-#include <sched.h>
-#include <pthread.h>
-void racacit_yield(void);   /* win32_compat.c: sched_yield without the macOS priority depression */
-static atomic_int g_lockline;
-#if defined(__aarch64__) || defined(__arm64__)
-#define SPU_LL_PAUSE() __asm__ __volatile__("yield")
-#elif defined(__x86_64__) || defined(__i386__)
-#define SPU_LL_PAUSE() __builtin_ia32_pause()
-#else
-#define SPU_LL_PAUSE() ((void)0)
-#endif
-/* Test-and-test-and-set, as the Windows path above: spin on a plain read
- * with a pause and only then exchange, and give the CPU up after a while.
- * The bare exchange loop this replaces kept every waiting lane writing the
- * line, and with more busy threads than cores (main, RSX, backend, six SPU
- * lanes) a holder that lost its CPU left the others hammering until it got
- * one back. SPU_LL_SPIN=<n>: reads before yielding (default 2048). */
-static int s_ll_spin = -1;
-/* SPU_LL_STATS: when the lock was taken (hold times are measured at unlock). */
-static int s_ll_st = -1;
-static unsigned long spu_ll_tid(void)
-{
-#ifdef __APPLE__
-    uint64_t t = 0; pthread_threadid_np(NULL, &t); return (unsigned long)t;   /* = GetCurrentThreadId, as in the [hosttid] lines */
-#else
-    return 0;
-#endif
-}
-static unsigned long long s_ll_acq;
-static inline void spu_ll_note_acq(void)
-{
-    if (s_ll_st < 0) s_ll_st = getenv("SPU_LL_STATS") ? 1 : 0;
-    if (s_ll_st) { extern unsigned long long ps3_qpc_us(void); s_ll_acq = ps3_qpc_us(); }
-}
-void spu_lockline_lock(void)
-{
-    if (!atomic_exchange_explicit(&g_lockline, 1, memory_order_acquire)) { spu_ll_note_acq(); return; }
-    if (s_ll_spin < 0) { const char* e = getenv("SPU_LL_SPIN"); s_ll_spin = e ? atoi(e) : 2048; if (s_ll_spin < 1) s_ll_spin = 1; }
-    /* SPU_LL_STATS=1: contended acquisitions every 5 s -- how many, how many
-     * waited >= 1 ms, and the longest (a holder off its CPU stalls everyone). */
-    static int s_st = -1; if (s_st < 0) s_st = getenv("SPU_LL_STATS") ? 1 : 0;
-    extern unsigned long long ps3_qpc_us(void);
-    const unsigned long long t0 = s_st ? ps3_qpc_us() : 0;
-    unsigned spins = 0;
-    do {
-        while (atomic_load_explicit(&g_lockline, memory_order_relaxed)) {
-            SPU_LL_PAUSE();
-            if (++spins >= (unsigned)s_ll_spin) { spins = 0; racacit_yield(); }
-        }
-    } while (atomic_exchange_explicit(&g_lockline, 1, memory_order_acquire));
-    if (s_st) {
-        static unsigned long long n, slow, mx, last; const unsigned long long t = ps3_qpc_us(), d = t - t0;
-        n++; if (d >= 1000) { slow++; extern void ps3_tl_at(unsigned long long, char, uint32_t, uint32_t); ps3_tl_at(t0, 'K', 0x11u, (uint32_t)d); } if (d > mx) mx = d;
-        if (!last) last = t;
-        if (t - last > 5000000ull) { fprintf(stderr, "[ll-wait] 5 s: %llu contended, %llu >= 1 ms, longest %llu us%c", n, slow, mx, 10); n = slow = mx = 0; last = t; }
-    }
-    spu_ll_note_acq();
-}
-void spu_lockline_unlock(void)
-{
-    if (s_ll_st > 0) {
-        extern unsigned long long ps3_qpc_us(void);
-        const unsigned long long d = ps3_qpc_us() - s_ll_acq;
-        if (d >= 1000) {
-            static int told; char nm[64] = "?";
-            pthread_getname_np(pthread_self(), nm, sizeof nm);
-            if (told++ < 200) fprintf(stderr, "[ll-hold] %llu us by thread \"%s\" tid %lu%c", d, nm, spu_ll_tid(), 10);
-        }
-    }
-    atomic_store_explicit(&g_lockline, 0, memory_order_release);
-}
-void spu_spin_wait(volatile long* lock)
-{
-    unsigned spins = 0;
-    while (*lock) {
-        SPU_LL_PAUSE();
-        if (++spins >= 1024u) { spins = 0; racacit_yield(); }
-    }
-}
+static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
+void spu_lockline_lock(void)   { while (atomic_flag_test_and_set_explicit(&g_lockline, memory_order_acquire)) { } }
+void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_order_release); }
 #endif
 
 /* ===========================================================================

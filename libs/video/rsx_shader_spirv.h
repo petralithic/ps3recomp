@@ -72,6 +72,10 @@ void rsx_hlsl_to_spirv_cache_stats(RsxSpirvCacheStats* out);
  * PS3RECOMP_SPIRV_CACHE again on the next request. Disk files stay. */
 void rsx_hlsl_to_spirv_cache_reset(void);
 
+/* RACiT: the boot-time open its Prepare-shaders path calls. v0.19 opens the
+ * cache lazily on the first request, so this is a no-op kept for the caller. */
+void rsx_hlsl_to_spirv_cache_open(void);
+
 #ifdef __cplusplus
 }
 #endif

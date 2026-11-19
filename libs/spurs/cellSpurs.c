@@ -2005,9 +2005,6 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
 #endif
     ps3_tprof_thread('S', (uint32_t)slot->spu_num);
-#ifdef __APPLE__
-    { extern void racacit_thread_qos(const char*); racacit_thread_qos("SPU"); }
-#endif
 #ifdef _WIN32
     /* racacit: PS3_SAMPLE_SPURS=<n> profiles virtual SPU n-1 only; "all" adds
      * every SPU worker in turn (scripts/dev/hot_funcs.py). */
@@ -2063,9 +2060,6 @@ static DWORD WINAPI spurs_kernel_thread(LPVOID p)
 {
     struct SpursInst* si = (struct SpursInst*)p;
     ps3_thread_name("spurs kernel");
-#ifdef __APPLE__
-    { extern void racacit_thread_qos(const char*); racacit_thread_qos("SPUK"); }
-#endif
     int disabled = getenv("PS3_NO_SPURS_PM") != NULL;
     unsigned kick_run = 0;
     AcquireSRWLockExclusive(&si->lock);

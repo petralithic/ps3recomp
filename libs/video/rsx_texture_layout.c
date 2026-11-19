@@ -285,8 +285,7 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
         return;
     }
 
-    const u32 l2w = rsx_log2_ceil(w), l2h = rsx_log2_ceil(h);
-    const u32 sbpp = tl->bytes_per_texel, dbpp = tl->dst_bytes_per_texel;
+    const u32 sbpp = tl->bytes_per_texel;
 
     /* R8 and R8G8 reach the host byte for byte. A linear one is then a
      * straight row copy, which is worth keeping as a separate path: it is the
@@ -300,51 +299,71 @@ void rsx_texture_decode(void* dst, u32 dst_pitch,
         return;
     }
 
-#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-    /* Linear A8R8G8B8 / D8R8G8B8 is a byte rotation per texel (guest A,R,G,B
-     * to host R,G,B,A), which the compiler vectorizes; through decode_texel
-     * it was most of the cost of re-uploading a full-screen render target
-     * read back as a texture. Same bytes as decode_texel. */
-    if (!tl->swizzled && (tl->base_format == 0x85u || tl->base_format == 0x9Eu) &&
-        sbpp == 4u && dbpp == 4u) {
-        const u32 alpha = tl->base_format == 0x9Eu ? 0xFF000000u : 0u;
-        for (u32 y = 0; y < h; y++) {
-            const u8* srow = src + (size_t)y * tl->row_bytes;
-            u8* drow = d + (size_t)y * dst_pitch;
-            for (u32 x = 0; x < w; x++) {
-                u32 v;
-                memcpy(&v, srow + (size_t)x * 4u, 4);
-                if (!argb_as_rgba) v = (v >> 8) | (v << 24);
-                v |= alpha;
-                memcpy(drow + (size_t)x * 4u, &v, 4);
-            }
-        }
+    /* RSX_TEX_DECODE_SLOW=1: the texel-by-texel walk below for everything (the
+     * reference the fast paths are tested against). */
+    static int slow = -1;
+    if (slow < 0) { const char* e = getenv("RSX_TEX_DECODE_SLOW"); slow = e && *e == '1'; }
+    if (!slow && w <= 4096u && h <= 4096u) {
+        rsx_texture_decode_fast(d, dst_pitch, src, w, h, tl, argb_as_rgba);
         return;
     }
-#endif
+    rsx_texture_decode_slow(d, dst_pitch, src, w, h, tl, argb_as_rgba);
+}
 
-    /* Morton order interleaves the low bits of x and y, so a swizzled image
-     * has to be walked texel by texel; so does anything the host cannot take
-     * as stored. x's and y's bits land on separate positions of the swizzled
-     * offset, so it is the OR of a y part, computed once a row, and an x part
-     * stepped with the dilated increment (d - mask) & mask. Interleaving every
-     * texel's bits afresh was most of the decode in God of War HD's texture
-     * bursts. */
-    const u32 xmask = tl->swizzled ? rsx_swizzle_offset((1u << l2w) - 1u, 0, l2w, l2h) : 0;
+/* Morton order interleaves the low bits of x and y, so a swizzled image has to
+ * be walked texel by texel; so does anything the host cannot take as stored. */
+void rsx_texture_decode_slow(void* dst, u32 dst_pitch, const u8* src, u32 w, u32 h,
+                             const rsx_tex_layout* tl, int argb_as_rgba)
+{
+    u8* d = (u8*)dst;
+    const u32 l2w = rsx_log2_ceil(w), l2h = rsx_log2_ceil(h);
+    const u32 sbpp = tl->bytes_per_texel, dbpp = tl->dst_bytes_per_texel;
     for (u32 y = 0; y < h; y++) {
         u8* drow = d + (size_t)y * dst_pitch;
-        if (tl->swizzled) {
-            const u32 yoff = rsx_swizzle_offset(0, y, l2w, l2h);
-            u32 xoff = 0;
+        for (u32 x = 0; x < w; x++) {
+            const u8* s = tl->swizzled
+                ? src + (size_t)rsx_swizzle_offset(x, y, l2w, l2h) * sbpp
+                : src + (size_t)y * tl->row_bytes + (size_t)x * sbpp;
+            decode_texel(tl, s, drow + (size_t)x * dbpp, argb_as_rgba);
+        }
+    }
+}
+
+/* The same result, faster (a streamed-in area decodes hundreds of uncompressed
+ * textures, each ~1M texels, on the RSX thread: 10-15 ms apiece in Into the
+ * Nexus's opening, the stutter while new scenery streams in). The swizzle is a
+ * pure bit interleave, so a texel's offset is a column part OR a row part,
+ * each looked up from a table made once per level; the 32-bit A8R8G8B8 /
+ * D8R8G8B8 formats are one rotate per texel. Other formats keep decode_texel. */
+void rsx_texture_decode_fast(void* dst, u32 dst_pitch, const u8* src, u32 w, u32 h,
+                             const rsx_tex_layout* tl, int argb_as_rgba)
+{
+    u8* d = (u8*)dst;
+    const u32 sbpp = tl->bytes_per_texel, dbpp = tl->dst_bytes_per_texel;
+    u32 mx[4096], my_;
+    const u32 l2w = rsx_log2_ceil(w), l2h = rsx_log2_ceil(h);
+    if (tl->swizzled)
+        for (u32 x = 0; x < w; x++) mx[x] = rsx_swizzle_offset(x, 0, l2w, l2h) * sbpp;
+    else
+        for (u32 x = 0; x < w; x++) mx[x] = x * sbpp;
+    const int argb32 = (tl->base_format == 0x85u || tl->base_format == 0x9Eu) && sbpp == 4u && dbpp == 4u;
+    const u32 alpha_or = tl->base_format == 0x9Eu ? 0xFF000000u : 0u;
+    for (u32 y = 0; y < h; y++) {
+        my_ = tl->swizzled ? rsx_swizzle_offset(0, y, l2w, l2h) * sbpp : y * tl->row_bytes;
+        const u8* srow = src + my_;
+        u8* drow = d + (size_t)y * dst_pitch;
+        if (argb32) {
+            /* Guest bytes A,R,G,B: a little-endian load is A|R<<8|G<<16|B<<24,
+             * and R,G,B,A is that rotated right by 8. */
             for (u32 x = 0; x < w; x++) {
-                decode_texel(tl, src + (size_t)(xoff | yoff) * sbpp,
-                             drow + (size_t)x * dbpp, argb_as_rgba);
-                xoff = (xoff - xmask) & xmask;
+                u32 v; memcpy(&v, srow + mx[x], 4);
+                if (!argb_as_rgba) v = (v >> 8) | (v << 24);
+                v |= alpha_or;
+                memcpy(drow + (size_t)x * 4u, &v, 4);
             }
         } else {
-            const u8* srow = src + (size_t)y * tl->row_bytes;
             for (u32 x = 0; x < w; x++)
-                decode_texel(tl, srow + (size_t)x * sbpp, drow + (size_t)x * dbpp, argb_as_rgba);
+                decode_texel(tl, srow + mx[x], drow + (size_t)x * dbpp, argb_as_rgba);
         }
     }
 }

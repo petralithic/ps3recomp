@@ -666,9 +666,20 @@ static void announce(int id, const char* why)
     rsx_host_ui_trophy_unlocked(id, s_set.when[id], 1);
 }
 
+static int (*s_gate)(void);
+static int gate_closed(int id)
+{
+    if (!s_gate || !s_gate()) return 0;
+    static int said;
+    if (said++ < 16) printf("[trophy] %d not unlocked: cheats are on or were used in this save\n", id);
+    return 1;
+}
+void sceNpTrophySetUnlockGate(int (*gate)(void)) { s_gate = gate; }
+
 int sceNpTrophyHostUnlock(int trophyId, const char* why)
 {
     if (s_set.loaded <= 0 || !s_set.dir[0]) return -1;
+    if (gate_closed(trophyId)) return 1;
     int plat;
     tlock();
     const int r = unlock_locked(trophyId, &plat);
@@ -1037,6 +1048,7 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
         return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
     if (s_set.t[trophyId].grade == SCE_NP_TROPHY_GRADE_PLATINUM)
         return SCE_NP_TROPHY_ERROR_CANNOT_UNLOCK_PLATINUM;
+    if (gate_closed(trophyId)) return SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED;
 
     int plat;
     tlock();

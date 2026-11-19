@@ -223,30 +223,8 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
     for (int j = 0; j < ht_used; j++) ht_n[j] = 0;
 }
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
-/* The syscall timing hook (ppu_loader.cpp) also gets every HLE import call:
- * num = 0x80000000 | the NID's low 31 bits. NULL unless a title sets it. */
-extern "C" void (*g_ppu_sc_time_hook)(ppu_context*, uint32_t num, unsigned long long us);
-extern "C" void ps3_hle_call_body(uint32_t nid, ppu_context* ctx);
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
-    if (__builtin_expect(g_ppu_sc_time_hook != 0, 0)) {
-        extern unsigned long long ps3_qpc_us(void);
-        const uint32_t lr = (uint32_t)ctx->lr;
-        const unsigned long long t0 = ps3_qpc_us();
-        ps3_hle_call_body(nid, ctx);
-        const unsigned long long d = ps3_qpc_us() - t0;
-        const uint64_t keep = ctx->lr; ctx->lr = lr;    /* key on the call site, not where the import returned */
-        g_ppu_sc_time_hook(ctx, 0x80000000u | (nid & 0x7FFFFFFFu), d);
-        ctx->lr = keep;
-        return;
-    }
-    ps3_hle_call_body(nid, ctx);
-}
-extern "C" void ps3_hle_call_body(uint32_t nid, ppu_context* ctx)
-{
-    if (const hle_fast_fn f = hle_fast(nid))
-        if (f(ctx)) return;
-
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
      * event queue, which misses a thread that stops looping while it is BUSY --

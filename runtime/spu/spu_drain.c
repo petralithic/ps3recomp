@@ -1,4 +1,3 @@
-#include <time.h>
 /* SPU_DRAIN trampoline model -- runtime state + stub hooks (faithful-adopt).
  *
  * Milestone 1 lands the execution-model plumbing; the per-transfer hooks
@@ -121,13 +120,13 @@ static void spu_job_stats(spu_context* ctx)
     if (on < 0) on = (getenv("SPU_JOB_STATS") ? 1 : 0) | (getenv("PS3_TIMELINE") ? 2 : 0) |
                      (getenv("PS3_SAMPLE_JOB") ? 4 : 0);
     if (!on) return;
-    static _Thread_local int active; static _Thread_local unsigned long long t0, c0;
+    static _Thread_local int active; static _Thread_local unsigned long long t0;
     static _Thread_local uint8_t guid[4];
     const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
     extern unsigned long long ps3_qpc_us(void);
     if (!active) {
         if (pc < 0x100u || pc >= 0x140u) return;
-        active = 1; t0 = ps3_qpc_us(); c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) / 1000; memcpy(guid, ctx->ls + 0x100, 4); t_spu_job_wait_us = 0;
+        active = 1; t0 = ps3_qpc_us(); memcpy(guid, ctx->ls + 0x100, 4); t_spu_job_wait_us = 0;
         if (t_samp_slot >= 0 && t_samp_slot < 8)
             g_samp_lane_job[t_samp_slot] = (uint32_t)guid[0] << 24 | (uint32_t)guid[1] << 16 | (uint32_t)guid[2] << 8 | guid[3];
         if (on & 2) { extern void ps3_tl_at(unsigned long long, char, uint32_t, uint32_t);
@@ -139,8 +138,7 @@ static void spu_job_stats(spu_context* ctx)
     active = 0;
     if (t_samp_slot >= 0 && t_samp_slot < 8) g_samp_lane_job[t_samp_slot] = 0;
     const unsigned long long d = ps3_qpc_us() - t0;
-    const unsigned long long cpu = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) / 1000 - c0;
-    typedef struct { uint32_t g; unsigned long long n, us, max, wus, cus; } ent;
+    typedef struct { uint32_t g; unsigned long long n, us, max, wus; } ent;
     static ent e[128]; static int ne; static volatile long mu; static unsigned long long last;
     const uint32_t g = (uint32_t)guid[0] << 24 | (uint32_t)guid[1] << 16 | (uint32_t)guid[2] << 8 | guid[3];
     if (on & 2) { extern void ps3_tl_at(unsigned long long, char, uint32_t, uint32_t); ps3_tl_at(t0 + d, 'j', g, (uint32_t)d); }
@@ -148,8 +146,8 @@ static void spu_job_stats(spu_context* ctx)
     while (__sync_lock_test_and_set(&mu, 1)) { }
     int k = 0;
     for (; k < ne; k++) if (e[k].g == g) break;
-    if (k == ne && ne < 128) { e[ne].g = g; e[ne].n = e[ne].us = e[ne].max = e[ne].wus = e[ne].cus = 0; ne++; }
-    if (k < ne) { e[k].n++; e[k].us += d; e[k].wus += t_spu_job_wait_us; e[k].cus += cpu; if (d > e[k].max) e[k].max = d; }
+    if (k == ne && ne < 128) { e[ne].g = g; e[ne].n = e[ne].us = e[ne].max = e[ne].wus = 0; ne++; }
+    if (k < ne) { e[k].n++; e[k].us += d; e[k].wus += t_spu_job_wait_us; if (d > e[k].max) e[k].max = d; }
     const unsigned long long now = ps3_qpc_us();
     if (!last) last = now;
     if (now - last > 5000000ull) {
@@ -159,8 +157,8 @@ static void spu_job_stats(spu_context* ctx)
             int b = -1;
             for (int j = 0; j < ne; j++) if (e[j].n && (b < 0 || e[j].us > e[b].us)) b = j;
             if (b < 0) break;
-            fprintf(stderr, "   %08x: %llu runs, %.1f ms total, %.0f us avg, %.2f ms max, %.1f ms in lock-line waits, %.1f ms on CPU%c", e[b].g, e[b].n,
-                    e[b].us / 1e3, (double)e[b].us / (double)e[b].n, e[b].max / 1e3, e[b].wus / 1e3, e[b].cus / 1e3, 10);
+            fprintf(stderr, "   %08x: %llu runs, %.1f ms total, %.0f us avg, %.2f ms max, %.1f ms in lock-line waits%c", e[b].g, e[b].n,
+                    e[b].us / 1e3, (double)e[b].us / (double)e[b].n, e[b].max / 1e3, e[b].wus / 1e3, 10);
             e[b].n = 0;
         }
         ne = 0;

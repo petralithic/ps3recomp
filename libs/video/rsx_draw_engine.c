@@ -28,6 +28,9 @@
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
+#if !defined(__AVX2__) && defined(__SSE4_1__)
+#include <smmintrin.h>
+#endif
 
 /* Guest memory and the RSX offset resolvers, declared the way every backend
  * that reads guest data declares them (rsx_vertex_fetch.h). */
@@ -1146,13 +1149,6 @@ static int eng_surface_retire(u32 slot)
                 s->location, s->offset, s->w, s->h, swz ? " swizzled" : "", age, n_ret, 10);
     if (why) { eng_retired_note(s, span ? span : s->w * s->h * 4u, why); return 0; }
     if (rsx_ww_on() && rsx_ww_guest_written_since(dst, span, s->ww_epoch)) { n_skip++; return 0; }
-    /* Without the write watch (macOS, or RACACIT_NO_WRITE_WATCH) the engine
-     * cannot tell whether the game has reused this memory since the target
-     * was drawn. In main memory the game recycles such ranges for other data
-     * (SPU job code and buffers among it), and writing stale pixels over them
-     * hung Zolar Forest: an SPU job then branched into the pixels. Leave main
-     * memory alone; local (video) memory only ever holds graphics. */
-    if (!rsx_ww_on() && s->location == 1) { n_skip++; return 0; }
     u8* px = (u8*)malloc((size_t)s->w * s->h * 4u);
     if (!px) return -1;
     /* A failed readback writes nothing: the buffer is not pixels. */
@@ -1866,12 +1862,12 @@ static u32 eng_zdepth_snapshot(u32 slot)
  * and effect pass after it; over open sky (depth 1.0) the copy said 0, and
  * all of them failed their depth test there: the Aphelion's blaster bolts
  * were invisible until they flew in front of something. */
-/* This full-screen quad carries only ATTR0; no colour/texcoord inputs. */
-static const char* const kEngDepthAsColorVS =
-"float4 main(float4 a0 : ATTR0) : SV_Position { return a0; }\n";
 static const char* const kEngDepthAsColorPS =
 "struct PSInput {\n"
-"    float4 position : SV_POSITION;\n"
+"    float4 position : SV_POSITION; float4 col0 : COLOR0; float4 col1 : COLOR1;\n"
+"    float4 fog : FOG;\n"
+"    float4 tc0:TEXCOORD0; float4 tc1:TEXCOORD1; float4 tc2:TEXCOORD2; float4 tc3:TEXCOORD3;\n"
+"    float4 tc4:TEXCOORD4; float4 tc5:TEXCOORD5; float4 tc6:TEXCOORD6; float4 tc7:TEXCOORD7;\n"
 "};\n"
 "Texture2D    rsx_tex[16] : register(t0);\n"
 "SamplerState rsx_samp[16] : register(s0);\n"
@@ -1892,6 +1888,36 @@ static const char* const kEngDepthAsColorPS =
  * fragment constants resets s_ps_last_n. */
 static u8* s_ps_last; static u32 s_ps_last_n, s_ps_last_cap;
 static u32 s_d2c_pipe;        /* 0 = not built yet, ENG_INVALID = failed */
+/* Its vertex shader: kEngFixedVS's transform, but only ATTR0 declared. The
+ * pass is fed one vertex slot (position), and a vertex input with no
+ * attribute behind it is a Vulkan error (VUID-VkGraphicsPipelineCreateInfo-
+ * Input-07904) that reads whatever the driver leaves there. */
+static const char* const kEngDepthAsColorVS =
+"struct VSInput { float4 a0:ATTR0; };\n"
+"struct VSOutput {\n"
+"    float4 pos:SV_Position; float4 col0:COLOR0; float4 col1:COLOR1;\n"
+"    float4 fog:FOG;\n"
+"    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
+"    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
+"};\n"
+"cbuffer VPConst : register(b0) {\n"
+"    float4 vp_c[512];\n"
+"    float4 vp_posscale;\n"
+"    float4 vp_posoffset;\n"
+"};\n"
+"VSOutput main(VSInput input) {\n"
+"    float4 _p = float4(dot(vp_c[0], input.a0), dot(vp_c[1], input.a0),\n"
+"                       dot(vp_c[2], input.a0), dot(vp_c[3], input.a0));\n"
+"    float _m = dot(abs(vp_c[0]), 1.0) + dot(abs(vp_c[1]), 1.0)\n"
+"             + dot(abs(vp_c[2]), 1.0) + dot(abs(vp_c[3]), 1.0);\n"
+"    if (_m == 0.0) _p = input.a0;\n"
+"    VSOutput Out;\n"
+"    Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);\n"
+"    Out.col0 = (float4)0; Out.col1 = float4(0,0,0,1); Out.fog = (float4)0;\n"
+"    Out.t0 = (float4)0; Out.t1 = (float4)0; Out.t2 = (float4)0; Out.t3 = (float4)0;\n"
+"    Out.t4 = (float4)0; Out.t5 = (float4)0; Out.t6 = (float4)0; Out.t7 = (float4)0;\n"
+"    return Out;\n"
+"}\n";
 static const char* const kEngFixedVS;
 
 static u32 eng_zdepth_as_color(u32 slot)
@@ -3633,6 +3659,88 @@ static u32 s_tm_dim[RSX_DSP_NUM_TEXTURES][2];
 #define PSTAGE(i) do { const u64 _n = eng_rdtsc(); s_pstage[i] += _n - _pt; _pt = _n; } while (0)
 static u64 s_last_pipe_key;   /* the key eng_pipeline_get last resolved (RSX_ENG_PROBE) */
 static int s_srgb_draw;       /* the draw eng_pipeline_get last saw packs its colour as sRGB */
+const rsx_prog_inputs* rsx_draw_engine_cur_prog;
+const u8* rsx_draw_engine_cur_vp;
+const u8* rsx_draw_engine_cur_fp;
+
+/* The shader text eng_pipeline_get builds, from its inputs alone (the shader
+ * prepare calls it again for recorded programs). The same calls in the same
+ * order as before it was split out: the text must not change, it is the
+ * pipeline cache's key. */
+void rsx_draw_engine_gen_hlsl(const rsx_prog_inputs* in, const u8* vp_uc, const u8* fp_uc,
+                              char* vs, u32 vs_size, char* ps, u32 ps_size,
+                              int* vi_out, int* fi_out, u32* nconst, u32* dbz_bit_out)
+{
+    int vi = 1, fi = 1;
+    u32 dbz_bit = 0;
+    *nconst = 0;
+    if (in->fixed) {
+        snprintf(vs, vs_size, "%s", kEngFixedVS);
+        snprintf(ps, ps_size, "%s", kEngFixedPS);
+        *vi_out = vi; *fi_out = fi;
+        if (dbz_bit_out) *dbz_bit_out = 0;
+        return;
+    }
+    const int dyn_tex = in->dyn_tex != 0;
+    const u32 cube_mask = in->cube_mask, vol_mask = in->vol_mask, dbz = in->dbz;
+    rsx_vp_set_branch_bits(in->branch_bits);
+    vi = rsx_vp_decompile_compact_ex(vp_uc, in->vp_bytes, in->vtex_mask, in->layout_mask, vs, vs_size);
+    if (vi > 0 && in->ucp && rsx_vp_apply_user_clip(vs, vs_size, in->ucp) < 0) {
+        vi = -1;
+        static u32 said;
+        if (PS3_LOG_FIRST(said, 8))
+            fprintf(stderr, "[rsx engine] user clip planes 0x%06X: vertex program text not in the"
+                            " decompiler's form, draw skipped\n", in->ucp);
+    }
+    rsx_vp_set_branch_bits(0);
+    rsx_fp_shadow_mask = in->shadow_mask;
+    rsx_fp_biased_mask = dyn_tex ? 0u : in->biased_mask;
+    rsx_fp_gamma_mask = dyn_tex ? 0u : in->gamma_mask;
+    rsx_fp_dynamic_tex = dyn_tex;
+    rsx_fp_tex3d_mask = dyn_tex ? in->t3d : 0u;
+    rsx_fp_srgb_out = (int)in->srgb_out;
+    memcpy(rsx_fp_shadow_func, in->shadow_func, sizeof in->shadow_func);
+    /* RACiT's globals-driven modes; upstream's per-call shadow/gamma/expand
+     * descriptors stay off (NULL), the volume mask is upstream's. */
+    fi = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp_uc, in->fp_bytes, in->fp_ctrl, cube_mask, vol_mask,
+            NULL, NULL, NULL, ps, ps_size, nconst);
+    rsx_fp_shadow_mask = 0;
+    rsx_fp_biased_mask = 0;
+    rsx_fp_gamma_mask = 0;
+    rsx_fp_dynamic_tex = 0;
+    rsx_fp_tex3d_mask = 0;
+    rsx_fp_srgb_out = 0;
+    if (fi > 0 && (in->wpos_grid[0] > 1u || in->wpos_grid[1] > 1u) &&
+        rsx_fp_apply_wpos_grid(ps, ps_size, in->wpos_grid[0], in->wpos_grid[1]) < 0)
+        fi = -1;
+    if (fi > 0 && in->alpha_test &&
+        rsx_fp_apply_alpha_test_buffered(ps, ps_size, in->alpha_func) < 0)
+        fi = -1;
+    if (fi > 0 && dbz) {
+        if (rsx_fp_apply_depth_bounds(ps, ps_size, dbz - 1u) > 0) {
+            dbz_bit = 1u << (dbz - 1u);   /* read with Load: no rsx_samp[] names it */
+        } else {
+            static u32 said;   /* drawn unbounded rather than dropped */
+            if (PS3_LOG_FIRST(said, 8))
+                fprintf(stderr, "[rsx engine] depth bounds not applied to a fragment program"
+                                " (unexpected text)\n");
+        }
+    }
+    if (fi > 0 && dyn_tex) {
+        /* Every 2D unit scales its coordinates by fp_texp: (1,1) unless
+         * it is unnormalised, whatever it is bound to this draw. */
+        if (rsx_fp_apply_unnorm_scale(ps, ps_size, 0xFFFFu & ~cube_mask,
+                                      NULL, cube_mask, vol_mask) < 0)
+            fi = -1;
+    } else if (fi > 0 && in->unnorm_mask) {
+        if (rsx_fp_apply_unnorm_scale(ps, ps_size, in->unnorm_mask,
+                                      (const u32 (*)[3])in->unnorm_dim, cube_mask, vol_mask) < 0)
+            fi = -1;
+    }
+    *vi_out = vi; *fi_out = fi;
+    if (dbz_bit_out) *dbz_bit_out = dbz_bit;
+}
+
 static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
                             const rsx_be_render_state* rs,
                             rsx_be_format rt_fmt, u32 rt_count, int* out_fixed,
@@ -3799,82 +3907,42 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     u32 nconst = 0;
     u32 dbz_bit = 0;
     const u64 hp0_ = eng_hf_tsc();
-    if (fixed) {
-        snprintf(s_vs_hlsl, sizeof s_vs_hlsl, "%s", kEngFixedVS);
-        snprintf(s_ps_hlsl, sizeof s_ps_hlsl, "%s", kEngFixedPS);
-    } else {
-        rsx_vp_set_branch_bits(branch_bits);
-        vi = rsx_vp_decompile_compact_ex(vp_uc, vp_instrs * 16u, vtex_mask,
-                                         layout->mask, s_vs_hlsl,
-                                         sizeof s_vs_hlsl);
-        if (vi > 0 && ucp && rsx_vp_apply_user_clip(s_vs_hlsl, sizeof s_vs_hlsl, ucp) < 0) {
-            vi = -1;
-            static u32 said;
-            if (PS3_LOG_FIRST(said, 8))
-                fprintf(stderr, "[rsx engine] user clip planes 0x%06X: vertex program text not in the"
-                                " decompiler's form, draw skipped\n", rsx_dsp_reg(&g.rsx, 0x1478u));
-        }
-        rsx_vp_set_branch_bits(0);
-        rsx_fp_shadow_mask = shadow_mask;
-        rsx_fp_biased_mask = dyn_tex ? 0u : biased_mask;
-        rsx_fp_gamma_mask = dyn_tex ? 0u : gamma_mask;
-        rsx_fp_dynamic_tex = dyn_tex;
-        rsx_fp_tex3d_mask = dyn_tex ? mc.t3d : 0u;
-        rsx_fp_srgb_out = srgb_out;
-        memcpy(rsx_fp_shadow_func, shadow_func, sizeof shadow_func);
-        /* RACiT's globals-driven modes; upstream's per-call shadow/gamma/expand
-         * descriptors stay off (NULL), the volume mask is upstream's. */
-        fi = rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(fp_uc, fp_size, fp_ctrl, cube_mask, vol_mask,
-                NULL, NULL, NULL, s_ps_hlsl, sizeof s_ps_hlsl, &nconst);
-        rsx_fp_shadow_mask = 0;
-        rsx_fp_biased_mask = 0;
-        rsx_fp_gamma_mask = 0;
-        rsx_fp_dynamic_tex = 0;
-        rsx_fp_tex3d_mask = 0;
-        rsx_fp_srgb_out = 0;
-        if (fi > 0 && nconst != g.fp_constants.count) fi = -1;
-        if (fi > 0 && wpos_scaled &&
-            rsx_fp_apply_wpos_grid(s_ps_hlsl, sizeof s_ps_hlsl, wpos_grid[0], wpos_grid[1]) < 0)
-            fi = -1;
-        if (fi > 0 && rs->alpha_test_enable &&
-            rsx_fp_apply_alpha_test_buffered(s_ps_hlsl, sizeof s_ps_hlsl,
-                                             rs->alpha_func) < 0)
-            fi = -1;
-        if (fi > 0 && dbz) {
-            if (rsx_fp_apply_depth_bounds(s_ps_hlsl, sizeof s_ps_hlsl, dbz - 1u) > 0) {
-                dbz_bit = 1u << (dbz - 1u);   /* read with Load: no rsx_samp[] names it */
-            } else {
-                static u32 said;   /* drawn unbounded rather than dropped */
-                if (PS3_LOG_FIRST(said, 8))
-                    fprintf(stderr, "[rsx engine] depth bounds not applied to a fragment program"
-                                    " (unexpected text)\n");
-            }
-        }
-        if (fi > 0 && dyn_tex) {
-            /* Every 2D unit scales its coordinates by fp_texp: (1,1) unless
-             * it is unnormalised, whatever it is bound to this draw. */
-            if (rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, 0xFFFFu & ~cube_mask,
-                                          NULL, cube_mask, vol_mask) < 0)
-                fi = -1;
-        } else if (fi > 0 && unnorm_mask) {
-            u32 dim3[RSX_DSP_NUM_TEXTURES][3];
-            for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+    static rsx_prog_inputs pin;
+    memset(&pin, 0, sizeof pin);
+    pin.version = RSX_PROG_INPUTS_VERSION;
+    pin.fixed = fixed ? 1u : 0u;
+    if (!fixed) {
+        pin.vp_bytes = vp_instrs * 16u; pin.fp_bytes = fp_size;
+        pin.vtex_mask = vtex_mask; pin.layout_mask = layout->mask; pin.branch_bits = branch_bits;
+        pin.fp_ctrl = fp_ctrl; pin.cube_mask = cube_mask; pin.shadow_mask = shadow_mask;
+        pin.biased_mask = biased_mask; pin.dyn_tex = dyn_tex ? 1u : 0u; pin.t3d = mc.t3d;
+        pin.srgb_out = srgb_out ? 1u : 0u; pin.gamma_mask = gamma_mask;
+        pin.alpha_test = rs->alpha_test_enable ? 1u : 0u; pin.alpha_func = rs->alpha_func;
+        pin.unnorm_mask = unnorm_mask;
+        for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; u++) {
+            pin.unnorm_dim[u][0] = unnorm_dim[u][0]; pin.unnorm_dim[u][1] = unnorm_dim[u][1];
+            pin.unnorm_dim[u][2] = 1u;
+            if (!dyn_tex && (unnorm_mask & (1u << u))) {
                 rsx_dsp_texture t3;
                 rsx_dsp_get_texture(&g.rsx, u, &t3);
-                dim3[u][0] = unnorm_dim[u][0]; dim3[u][1] = unnorm_dim[u][1];
-                dim3[u][2] = t3.depth ? t3.depth : 1u;
+                pin.unnorm_dim[u][2] = t3.depth ? t3.depth : 1u;
             }
-            if (rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
-                                          (const u32 (*)[3])dim3, cube_mask, vol_mask) < 0)
-                fi = -1;
         }
+        memcpy(pin.shadow_func, shadow_func, sizeof pin.shadow_func);
+        pin.vol_mask = vol_mask; pin.ucp = ucp; pin.dbz = dbz;
+        if (wpos_scaled) { pin.wpos_grid[0] = wpos_grid[0]; pin.wpos_grid[1] = wpos_grid[1]; }
     }
+    rsx_draw_engine_gen_hlsl(&pin, vp_uc, fp_uc, s_vs_hlsl, sizeof s_vs_hlsl,
+                             s_ps_hlsl, sizeof s_ps_hlsl, &vi, &fi, &nconst, &dbz_bit);
+    if (!fixed && fi > 0 && nconst != g.fp_constants.count) fi = -1;
     /* RSX_FP_DEBUG_KEY=<hex pipeline key>: that pipeline's fragment program
      * returns its inputs instead of its colour, in 24-pixel screen stripes:
      * TEXCOORD1.xy (fract), unit 0 sampled there (rgb), COLOR0.rgb, and
      * (TEXCOORD0.w, COLOR0.a, unit 0 alpha). Which input breaks a draw, in
      * one picture. */
-    { static u64 s_dk = 1;
+    static u64 s_dk = 1;
+    int od_used = 0;
+    {
       static u64 s_dkl[32]; static int s_ndk;
       if (s_dk == 1) { const char* k = getenv("RSX_FP_DEBUG_KEY"); s_dk = 0;
                        for (const char* q = k; q && *q && s_ndk < 32; ) { char* e; const u64 v = strtoull(q, &e, 16);
@@ -3927,12 +3995,20 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
       if (od && *od && fi > 0) {
           char path[1024]; snprintf(path, sizeof path, "%s/%016llx_ps.hlsl", od, (unsigned long long)key);
           FILE* f = fopen(path, "rb");
-          if (f) { const size_t n = fread(s_ps_hlsl, 1, sizeof s_ps_hlsl - 1, f); fclose(f); s_ps_hlsl[n] = 0;
+          if (f) { const size_t n = fread(s_ps_hlsl, 1, sizeof s_ps_hlsl - 1, f); fclose(f); s_ps_hlsl[n] = 0; od_used = 1;
                    fprintf(stderr, "[rsx engine] RSX_ENG_PS_OVERRIDE: pipeline %016llx uses %s (%u bytes)%c",
                            (unsigned long long)key, path, (unsigned)n, 10); } } }
-    if (vi > 0 && fi > 0 && !dbg_drop)
+    if (vi > 0 && fi > 0 && !dbg_drop) {
+        /* What the text came from, for the backend's program record -- not
+         * when a debug override changed the text. */
+        const int plain = !s_dk && !od_used;
+        rsx_draw_engine_cur_prog = plain ? &pin : NULL;
+        rsx_draw_engine_cur_vp = fixed ? NULL : vp_uc;
+        rsx_draw_engine_cur_fp = fixed ? NULL : fp_uc;
         handle = g.be->pipeline_create(g.be->user, s_vs_hlsl, s_ps_hlsl, rs,
                                        layout, layout->stride, rt_fmt, rt_count);
+        rsx_draw_engine_cur_prog = NULL; rsx_draw_engine_cur_vp = rsx_draw_engine_cur_fp = NULL;
+    }
     const u64 fp_hash = fixed ? 0 : eng_fp_debug_hash(fp_uc, fp_size);
     /* RSX_ENGINE_SHADER_DUMP=<existing dir>: each new pipeline's two programs
      * as <dir>/pipe<handle>.vs.hlsl and .ps.hlsl, the handle being the one
@@ -4626,6 +4702,50 @@ static u32 eng_vb_scan(u32* out_lo, u32* out_hi)
             _mm256_storeu_si256((__m256i*)l8, vlo); _mm256_storeu_si256((__m256i*)h8, vhi);
             for (u32 k = 0; k < 8u; k++) { if (l8[k] < lo) lo = l8[k]; if (h8[k] > hi) hi = h8[k]; }
         }
+#elif defined(__SSE4_1__)
+        /* The same at 128 bits (RaCACiT_compat.exe): eight 16-bit (four
+         * 32-bit) indices a step. */
+        {
+            const __m128i vbase = _mm_set1_epi32((int)base_index), vmask = _mm_set1_epi32(0x000FFFFF);
+            __m128i vlo = _mm_set1_epi32(-1), vhi = _mm_setzero_si128();
+            if (esz == 2u) {
+                const __m128i sw = _mm_setr_epi8(1,0,3,2,5,4,7,6,9,8,11,10,13,12,15,14);
+                const int rchk = restart_en && restart_val <= 0xFFFFu;
+                const __m128i rv = _mm_set1_epi16((short)restart_val);
+                for (; i + 8u <= count; i += 8u) {
+                    const __m128i x = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(p + 2u * i)), sw);
+                    if (rchk) {
+                        const __m128i m = _mm_cmpeq_epi16(x, rv);
+                        if (!_mm_testz_si128(m, m)) { for (u32 k = 0; k < 8u; k++) VB_ONE(i + k); continue; }
+                    }
+                    const __m128i a = _mm_and_si128(_mm_add_epi32(_mm_cvtepu16_epi32(x), vbase), vmask);
+                    const __m128i c = _mm_and_si128(_mm_add_epi32(_mm_cvtepu16_epi32(_mm_srli_si128(x, 8)), vbase), vmask);
+                    _mm_storeu_si128((__m128i*)(s_vb_occ + n), a);
+                    _mm_storeu_si128((__m128i*)(s_vb_occ + n + 4u), c);
+                    n += 8u;
+                    vlo = _mm_min_epu32(vlo, _mm_min_epu32(a, c));
+                    vhi = _mm_max_epu32(vhi, _mm_max_epu32(a, c));
+                }
+            } else {
+                const __m128i sw = _mm_setr_epi8(3,2,1,0,7,6,5,4,11,10,9,8,15,14,13,12);
+                const __m128i rv = _mm_set1_epi32((int)restart_val);
+                for (; i + 4u <= count; i += 4u) {
+                    const __m128i x = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(p + 4u * i)), sw);
+                    if (restart_en) {
+                        const __m128i m = _mm_cmpeq_epi32(x, rv);
+                        if (!_mm_testz_si128(m, m)) { for (u32 k = 0; k < 4u; k++) VB_ONE(i + k); continue; }
+                    }
+                    const __m128i a = _mm_and_si128(_mm_add_epi32(x, vbase), vmask);
+                    _mm_storeu_si128((__m128i*)(s_vb_occ + n), a);
+                    n += 4u;
+                    vlo = _mm_min_epu32(vlo, a);
+                    vhi = _mm_max_epu32(vhi, a);
+                }
+            }
+            u32 l4[4], h4[4];
+            _mm_storeu_si128((__m128i*)l4, vlo); _mm_storeu_si128((__m128i*)h4, vhi);
+            for (u32 k = 0; k < 4u; k++) { if (l4[k] < lo) lo = l4[k]; if (h4[k] > hi) hi = h4[k]; }
+        }
 #endif
         for (; i < count; i++) VB_ONE(i);
     }
@@ -4861,8 +4981,7 @@ static int eng_geom_get(const rsx_vertex_layout_plan* layout, u32 prim, int rebu
         int same = eng_geom_unwritten(e);
         /* No write watch (macOS): an entry already matched by content this
          * frame is not hashed again for its next draws (a shadow pass and
-         * the main pass, say) -- the once-a-frame rule textures and vertex
-         * blocks follow. */
+         * the main pass, say) -- the once-a-frame rule textures follow. */
         if (!same && !rsx_ww_on() && e->checked == g.frames + 1u) {
             same = 1;
             /* RSX_ENG_VERIFY=2: still hash it, and say if the game rewrote it within the frame. */

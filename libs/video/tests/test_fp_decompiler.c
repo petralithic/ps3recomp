@@ -88,6 +88,15 @@ static void check_true(const char* test, int cond)
 #define CTRL_32BIT  0x40u
 #define CTRL_16BIT  0x00u
 
+extern float rsx_fp_wpos_scale;
+
+static int parens_balanced(const char* s)
+{
+    int d = 0;
+    for (; *s; s++) { if (*s == '(') d++; else if (*s == ')' && --d < 0) return 0; }
+    return d == 0;
+}
+
 int main(void)
 {
     char hlsl[16384];
@@ -125,6 +134,26 @@ int main(void)
         unsetenv("RSX_FP_DEBUG");
     }
 
+    /* Test 0 (first: the WPOS text is built once per process): a buffered program
+     * reading WPOS three times at 3x internal resolution. 0.9.9 cut the 105-character
+     * WPOS expression to 95 in emit_src, and glslang refused every such program on
+     * a 1.5x or 3x setting (a player's log: "HLSL parse: ... error at column 168"). */
+    {
+        rsx_fp_wpos_scale = 3.0f;
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x04) | OUTMASK_ALL | INSRC(0) | END);      /* MAD r0, WPOS, WPOS, -|WPOS| */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, T_INPUT | SWZ_IDENT);
+        put_word(prog + 12, T_INPUT | SWZ_IDENT | (1u << 17) | (1u << 18)); /* negate, abs */
+        u32 nk = 0;
+        int n = rsx_fp_decompile_buffered_ex(prog, sizeof(prog), CTRL_32BIT, 0, hlsl, sizeof(hlsl), &nk);
+        printf("-- test0 WPOS at 3x, buffered: %d\n", n);
+        check_true("wpos3x_translated", n >= 0);
+        check("wpos3x_whole_expr", hlsl,
+              "(input.position * float4((fp_alpha.y != 0.0 ? fp_alpha.yy : float2(0.333333333, 0.333333333)), 1.0, 1.0))).xyzw");
+        check_true("wpos3x_parens_balanced", parens_balanced(hlsl));
+    }
+
     /* Test 1: MOV r0, COL0  (write all, END). */
     {
         u8 prog[16];
@@ -137,8 +166,9 @@ int main(void)
         check("mov_dest",   hlsl, "r[0].xyzw =");
         check("mov_input",  hlsl, "input.col0");
         check("mov_entry",  hlsl, "float4 main(PSInput input) : SV_TARGET {");
-        check("mov_return", hlsl, "    float4 _o = r[0];\n"
-                                  "    return (_o == _o) ? _o : (float4)0;\n}\n");
+        /* v113's exact export text: it is part of every program's shader-cache key. */
+        check("mov_return", hlsl, "    float4 _o = r[0];\n    return (_o == _o) ? _o : (float4)0;\n}\n");
+        check_absent("no_nan0_helper", hlsl, "rsx_nan0");
     }
 
     /* Test 2: MUL r1.xy, r0, r0  (partial write mask). */
@@ -188,6 +218,19 @@ int main(void)
         rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
         check("tex_sample", hlsl, "rsx_tex[3].Sample(rsx_samp[3]");
         check("tex_coord",  hlsl, "input.tc0");
+
+        /* The same read on a shadow (depth-compare) unit: its own function,
+         * naming the texture directly. A Texture2D or SamplerState parameter
+         * is invalid SPIR-V without legalization (VUID-...-06924). */
+        extern u32 rsx_fp_shadow_mask;
+        rsx_fp_shadow_mask = 1u << 3;
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        rsx_fp_shadow_mask = 0;
+        check("shadow_call",     hlsl, "rsx_shadow_3(((input.tc0).xyzw).xyz, 0)");
+        check("shadow_fn",       hlsl, "#define RSX_SH_FN rsx_shadow_3\n#define RSX_SH_T rsx_tex[3]\n#define RSX_SH_S rsx_samp[3]\n");
+        check("shadow_gather",   hlsl, "RSX_SH_T.GatherRed(RSX_SH_S,");
+        check_absent("shadow_no_tex_param", hlsl, "Texture2D t,");
+        check_absent("shadow_no_samp_param", hlsl, "SamplerState s,");
     }
 
     /* Test 5: negate + abs on a source (MOV r0, -|r1|). */
@@ -241,10 +284,8 @@ int main(void)
                                    "    float4 t1 : SV_TARGET1;\n"
                                    "};\n");
         check("mrt_entry",   hlsl, "PSOutput main(PSInput input) {");
-        check("mrt_t0",      hlsl, "float4 _o0 = r[0];\n"
-                                   "    _out.t0 = (_o0 == _o0) ? _o0 : (float4)0;");
-        check("mrt_t1",      hlsl, "float4 _o1 = r[2];\n"
-                                   "    _out.t1 = (_o1 == _o1) ? _o1 : (float4)0;");
+        check("mrt_t0",      hlsl, "    float4 _o0 = r[0];\n    _out.t0 = (_o0 == _o0) ? _o0 : (float4)0;");
+        check("mrt_t1",      hlsl, "    float4 _o1 = r[2];\n    _out.t1 = (_o1 == _o1) ? _o1 : (float4)0;");
         check("mrt_return",  hlsl, "    return _out;\n}\n");
         check_absent("mrt_no_target2", hlsl, "SV_TARGET2");
 

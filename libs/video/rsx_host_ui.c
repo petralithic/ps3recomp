@@ -388,7 +388,9 @@ enum { R_DISPLAY = 1, R_WINSIZE, R_VSYNC, R_ASPECT, R_UPSCALE, R_SHARP, R_BRIGHT
        R_RES, R_ANISO, R_TRI, R_DSSPK, R_DSVOL, R_DSHAP, R_DSHVOL, R_DSRUMBLE, R_DSTRIG, R_DSSWAP,
        R_DSLIGHT, R_DSMOTION, R_FPS, R_DISCORD, R_SKIPCLANK, R_RESUME, R_QUIT,
        R_PRESET, R_TEXQ, R_PACE, R_CPU, R_KBM, R_MSENS, R_MINV, R_DSTRIGSTR, R_TROPHIES,
-       R_FOV, R_CAMDIST, R_SKIPINTRO, R_SKIPSTART };
+       R_FOV, R_CAMDIST, R_SKIPINTRO, R_SKIPSTART,
+       R_CH_BOLTAMT, R_CH_ADDBOLTS, R_CH_WPN, R_CH_WPNUP, R_CH_WPNMAX, R_CH_WPNRESET, R_CH_GOD,
+       R_CH_DEST, R_CH_GO };
 typedef struct { int kind, id; const char* label; } ui_row;
 /* Three pages: General; Graphics -- every option that changes how the game
  * is drawn, for fitting it to a slower PC (each scales detail only: the
@@ -457,8 +459,42 @@ static const ui_row k_rows_graphics[] = {
 static const ui_row k_rows_trophies[] = {
     { K_OPT, R_TROPHIES, "Trophies" },
 };
+/* The cheat menu (RACACIT_CHEATS=1, from the launcher): a Cheats page in the
+ * Trophies page's place -- trophies and skill points are off while it is on
+ * (and for good in a save a cheat was used in; game/stubs.cpp). What each
+ * row does is the title's (rsx_cheat_api); the rows only ask and queue. */
+static const ui_row k_rows_cheats[] = {
+    { K_HEAD, 0, "Cheats on: no skill points or trophies" },
+    { K_OPT, R_CH_BOLTAMT,  "Bolts to add" },
+    { K_ACT, R_CH_ADDBOLTS, "Add bolts" },
+    { K_HEAD, 0, "Weapons" },
+    { K_OPT, R_CH_WPN,      "Weapon" },
+    { K_ACT, R_CH_WPNUP,    "Add a level to it" },
+    { K_ACT, R_CH_WPNMAX,   "Max out every weapon" },
+    { K_ACT, R_CH_WPNRESET, "Reset every weapon to level 1" },
+    { K_OPT, R_CH_GOD,      "God mode" },
+    { K_HEAD, 0, "Teleport" },
+    { K_OPT, R_CH_DEST,     "Destination" },
+    { K_ACT, R_CH_GO,       "Go there" },
+    { K_GAP, 0, "" },
+    { K_ACT, R_RESUME,  "Resume" },
+    { K_ACT, R_QUIT,    "Quit game" },
+};
+static const rsx_cheat_api* s_cheat;
+static const int k_ch_bolts[] = { 1000, 10000, 100000, 1000000 };
+static int s_ch_bolt = 1, s_ch_wsel, s_ch_dest;
+static char s_ch_msg[96]; static int s_ch_msg_row; static unsigned long long s_ch_msg_ms;
 #define N_PAGES 4
-static const char* const k_page_names[N_PAGES] = { "General", "Graphics", "Controls", "Trophies" };
+static const char* k_page_names[N_PAGES] = { "General", "Graphics", "Controls", "Trophies" };
+static int cheats_mode(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RACACIT_CHEATS"); on = e && *e == '1'; }
+    if (on && s_cheat) { k_page_names[3] = "Cheats"; return 1; }
+    return 0;
+}
+void rsx_host_ui_set_cheats(const rsx_cheat_api* api) { s_cheat = api; }
+static int tr_shown(void) { return s_page == TR_PAGE && !cheats_mode(); }
 static const ui_row* page_rows(int p, int* n)
 {
     /* Filtered copies, made once. Without the DualSense Plus mod: no
@@ -469,7 +505,10 @@ static const ui_row* page_rows(int p, int* n)
      * capture). */
     static ui_row f[3][N_OF(k_rows_controls) + N_OF(k_rows_general) + N_OF(k_rows_graphics)];
     static int fn[3] = { -1, -1, -1 };
-    if (p == TR_PAGE) { *n = N_OF(k_rows_trophies); return k_rows_trophies; }
+    if (p == TR_PAGE) {
+        if (cheats_mode()) { *n = N_OF(k_rows_cheats); return k_rows_cheats; }
+        *n = N_OF(k_rows_trophies); return k_rows_trophies;
+    }
     if (p < 0 || p > 2) p = 0;
     if (fn[p] < 0) {
         rsx_host_ui_load_options();
@@ -546,8 +585,64 @@ static int row_enabled(int i, const rsx_host_options* o)
     return 1;
 }
 
+/* ---- the cheat rows ---------------------------------------------------- */
+static void open_menu(int open);
+static void ch_say(int row, const char* msg) { snprintf(s_ch_msg, sizeof s_ch_msg, "%s", msg); s_ch_msg_row = row; s_ch_msg_ms = now_ms(); }
+static int ch_weapons(int* ids, int max) { return s_cheat && s_cheat->weapons ? s_cheat->weapons(ids, max) : 0; }
+static int ch_weapon_sel(void)   /* the selected weapon's id, or -1 */
+{
+    int ids[32]; const int n = ch_weapons(ids, 32);
+    if (n <= 0) return -1;
+    if (s_ch_wsel >= n) s_ch_wsel = n - 1;
+    if (s_ch_wsel < 0) s_ch_wsel = 0;
+    return ids[s_ch_wsel];
+}
+static int ch_value(int id, char* b, size_t n)   /* 1 if `id` is a cheat row */
+{
+    if (id < R_CH_BOLTAMT || id > R_CH_GO) return 0;
+    b[0] = 0;
+    if (s_ch_msg_row == id && now_ms() - s_ch_msg_ms < 4000) { snprintf(b, n, "%s", s_ch_msg); return 1; }
+    switch (id) {
+    case R_CH_BOLTAMT: { const int v = k_ch_bolts[s_ch_bolt];
+        if (v >= 1000000) snprintf(b, n, "%d,%03d,%03d", v / 1000000, v / 1000 % 1000, v % 1000);
+        else snprintf(b, n, "%d,%03d", v / 1000, v % 1000); break; }
+    case R_CH_WPN: {
+        const int w = ch_weapon_sel();
+        char nm[64] = ""; int lv = 0, top = 0;
+        if (w < 0 || !s_cheat->weapon(w, nm, sizeof nm, &lv, &top)) { snprintf(b, n, "No weapons with levels yet"); break; }
+        snprintf(b, n, "%s  %d / %d", nm, lv + 1, top + 1); break; }
+    case R_CH_GOD: snprintf(b, n, "%s", s_cheat && s_cheat->god && s_cheat->god() ? "On" : "Off"); break;
+    case R_CH_DEST: {
+        const int nd = s_cheat && s_cheat->n_dests ? s_cheat->n_dests() : 0;
+        if (nd <= 0) break;
+        s_ch_dest = (s_ch_dest % nd + nd) % nd;
+        snprintf(b, n, "%s", s_cheat->dest(s_ch_dest)); break; }
+    default: break;
+    }
+    return 1;
+}
+/* Left / right on a cheat row (and Enter / Cross, dir 1): 1 if handled. */
+static int ch_adjust(int id, int dir, int enter)
+{
+    if (id < R_CH_BOLTAMT || id > R_CH_GO || !s_cheat) return 0;
+    switch (id) {
+    case R_CH_BOLTAMT: s_ch_bolt = (s_ch_bolt + dir + N_OF(k_ch_bolts)) % N_OF(k_ch_bolts); break;
+    case R_CH_WPN: { int ids[32]; const int nw = ch_weapons(ids, 32); if (nw > 0) s_ch_wsel = (s_ch_wsel + dir + nw) % nw; break; }
+    case R_CH_GOD: s_cheat->command(RSX_CHEAT_GOD, !(s_cheat->god && s_cheat->god())); break;
+    case R_CH_DEST: { const int nd = s_cheat->n_dests ? s_cheat->n_dests() : 0; if (nd > 0) s_ch_dest = (s_ch_dest + dir + nd) % nd; break; }
+    case R_CH_ADDBOLTS: if (enter) { s_cheat->command(RSX_CHEAT_BOLTS, k_ch_bolts[s_ch_bolt]); ch_say(id, "Added"); } break;
+    case R_CH_WPNUP: if (enter) { const int w = ch_weapon_sel();
+        if (w >= 0) { s_cheat->command(RSX_CHEAT_WEAPON_UP, w); ch_say(id, "One level up"); } else ch_say(id, "No weapon picked"); } break;
+    case R_CH_WPNMAX: if (enter) { s_cheat->command(RSX_CHEAT_WEAPONS_MAX, 0); ch_say(id, "Done"); } break;
+    case R_CH_WPNRESET: if (enter) { s_cheat->command(RSX_CHEAT_WEAPONS_RESET, 0); ch_say(id, "Done"); } break;
+    case R_CH_GO: if (enter) { s_cheat->command(RSX_CHEAT_GO, s_ch_dest); ch_say(id, "On the way"); open_menu(0); } break;
+    }
+    return 1;
+}
+
 static void value_text(int id, const rsx_host_options* o, char* b, size_t n)
 {
+    if (ch_value(id, b, n)) return;
     b[0] = 0;
     switch (id) {
     case R_DISPLAY: snprintf(b, n, "%s", o->display_mode == RSX_UI_DISPLAY_EXCLUSIVE ? "Exclusive fullscreen"
@@ -604,6 +699,7 @@ static int cycle(int v, int n, int dir) { return ((v + dir) % n + n) % n; }
 /* Change the option on row `id` one step in `dir` (-1 / +1). */
 static void adjust(int id, int dir)
 {
+    if (ch_adjust(id, dir, 0)) return;
     int window = 0;
     LOCK();
     rsx_host_options* o = &s_opt;
@@ -735,6 +831,7 @@ static int activate(int dir)
     if (s_sel < 0 || s_sel >= N_ROWS) return 0;
     const int id = k_rows[s_sel].id;
     if (id == R_RESUME) { open_menu(0); return 0; }
+    if (ch_adjust(id, dir >= 0 ? 1 : -1, 1)) return 0;
     if (id == R_QUIT) {
         if (s_quit_armed) { if (s_dirty_ms) { settings_save(); s_dirty_ms = 0; } return 1; }
         s_quit_armed = 1; return 0;
@@ -905,7 +1002,7 @@ int rsx_host_ui_event(const SDL_Event* e)
             if (!e->key.repeat) { s_menu_src = k == SDLK_F1 ? "F1" : "Esc"; open_menu(!s_open); }
             return 0; }
         if (!s_open) return 0;
-        if (s_page == TR_PAGE) {
+        if (tr_shown()) {
             switch (k) {
             case SDLK_UP: case SDLK_w: tr_move(-1); return 0;
             case SDLK_DOWN: case SDLK_s: tr_move(+1); return 0;
@@ -949,7 +1046,7 @@ int rsx_host_ui_event(const SDL_Event* e)
             if (gc && SDL_GameControllerGetButton(gc, (SDL_GameControllerButton)other)) { s_menu_src = "L3+R3"; open_menu(!s_open); return 0; }
         }
         if (!s_open) return 0;
-        if (s_page == TR_PAGE) {
+        if (tr_shown()) {
             switch (b) {
             case SDL_CONTROLLER_BUTTON_DPAD_UP:   tr_move(-1); return 0;
             case SDL_CONTROLLER_BUTTON_DPAD_DOWN: tr_move(+1); return 0;
@@ -978,7 +1075,7 @@ int rsx_host_ui_event(const SDL_Event* e)
         if (abs(v) < 12000) held[a] = 0;
         if (!s_open || !dir || held[a]) return 0;
         held[a] = 1;
-        if (s_page == TR_PAGE) { if (a) tr_move(dir); return 0; }
+        if (tr_shown()) { if (a) tr_move(dir); return 0; }
         if (a) move_sel(dir);
         else if (k_rows[s_sel].kind == K_OPT) adjust(k_rows[s_sel].id, dir);
         return 0; }
@@ -1018,7 +1115,7 @@ int rsx_host_ui_event(const SDL_Event* e)
         return activate(e->button.button == SDL_BUTTON_RIGHT ? -1 : +1); }
     case SDL_MOUSEWHEEL:
         if (s_mcap) { LOCK(); s_mwheel += e->wheel.y; UNLOCK(); return 0; }
-        if (s_open && s_page == TR_PAGE) { if (e->wheel.y) tr_move(e->wheel.y > 0 ? -3 : 3); return 0; }
+        if (s_open && tr_shown()) { if (e->wheel.y) tr_move(e->wheel.y > 0 ? -3 : 3); return 0; }
         if (s_open && k_rows[s_sel].kind == K_OPT && e->wheel.y) adjust(k_rows[s_sel].id, e->wheel.y > 0 ? 1 : -1);
         return 0;
     case SDL_WINDOWEVENT:
@@ -1915,6 +2012,8 @@ static void tr_page(ui_out* o, float x0, float x1, float y, float y1, float pad)
     UNLOCK();
 }
 
+#include "rsx_perf_graph.h"
+
 int rsx_host_ui_build(const rsx_ui_font* f, int sw, int sh, rsx_ui_vtx* out, int cap)
 {
     if (!f || !f->pixels || sw <= 0 || sh <= 0) return 0;
@@ -1924,25 +2023,19 @@ int rsx_host_ui_build(const rsx_ui_font* f, int sw, int sh, rsx_ui_vtx* out, int
     const float px = (float)f->px, lh = (float)f->line_h;
 
     if (s_sv_active) { sv_build(&o, sw, sh); return o.n; }
-    if (opt.fps && !s_open) {
-        char b[64]; LOCK(); memcpy(b, s_fps_text, sizeof b); UNLOCK();
-        if (!b[0]) snprintf(b, sizeof b, "-- FPS");
-        const float x = px * 0.6f, y = px * 0.5f, w = text_w(f, b);
-        rect(&o, x - px * 0.4f, y - px * 0.15f, x + w + px * 0.4f, y + lh + px * 0.1f, rgba(0, 0, 0, 150));
-        text(&o, x, y, b, rgba(255, 230, 120, 255));
-    }
+    if (opt.fps && !s_open) racit_perf_overlay(&o, f);
     if (!s_open) { tr_popup(&o, sw, sh); return o.n; }
 
     /* Dim the game, then a centred panel. */
     rect(&o, 0, 0, (float)sw, (float)sh, rgba(0, 0, 0, 120));
 #ifdef __ANDROID__
-    const char* l1 = s_page == TR_PAGE ? (s_tr.show_hidden ? "Up/Down  scroll     Cross  hide the hidden trophies' details"
+    const char* l1 = tr_shown() ? (s_tr.show_hidden ? "Up/Down  scroll     Cross  hide the hidden trophies' details"
                                                            : "Up/Down  scroll     Cross  show the hidden trophies' details")
                                        : "Up/Down  choose     Left/Right  change     Cross  select";
     const char* l2 = "L1 R1 / tap a tab  page     Circle  close";
 #else
     const int kbm_row = s_sel >= 0 && s_sel < N_ROWS && (k_rows[s_sel].id == R_KBM || k_rows[s_sel].id == R_MSENS || k_rows[s_sel].id == R_MINV);
-    const char* l1 = s_page == TR_PAGE ? (s_tr.show_hidden ? "Up/Down  scroll     Enter / Cross  hide the hidden trophies' details"
+    const char* l1 = tr_shown() ? (s_tr.show_hidden ? "Up/Down  scroll     Enter / Cross  hide the hidden trophies' details"
                                                            : "Up/Down  scroll     Enter / Cross  show the hidden trophies' details")
                    : kbm_row ? "Click in the game to turn the camera with the mouse; F1 opens this menu"
                              : "Up/Down  choose     Left/Right  change     Enter / Cross  select";
@@ -1964,7 +2057,7 @@ int rsx_host_ui_build(const rsx_ui_font* f, int sw, int sh, rsx_ui_vtx* out, int
     float pw = px * 30.0f;
     { const float need = (text_w(f, l1) > text_w(f, l2) ? text_w(f, l1) : text_w(f, l2)) + pad * 2.0f;
       if (pw < need) pw = need; }
-    if (s_page == TR_PAGE) {   /* both footers of the Trophies page: the panel stays put when it changes */
+    if (tr_shown()) {   /* both footers of the Trophies page: the panel stays put when it changes */
         static const char* const both[2] = { "Up/Down  scroll     Enter / Cross  show the hidden trophies' details",
                                              "Up/Down  scroll     Enter / Cross  hide the hidden trophies' details" };
         for (int k = 0; k < 2; k++) if (pw < text_w(f, both[k]) + pad * 2.0f) pw = text_w(f, both[k]) + pad * 2.0f;
@@ -2001,10 +2094,10 @@ int rsx_host_ui_build(const rsx_ui_font* f, int sw, int sh, rsx_ui_vtx* out, int
 
     float y = y0 + pad + title_h;
     const float foot_y = y + content_h;   /* the footer stays put on a shorter page */
-    LOCK(); s_hit.x0 = (int)x0; s_hit.x1 = (int)x1; s_hit.n = s_page == TR_PAGE ? 0 : N_ROWS; UNLOCK();
-    if (s_page == TR_PAGE) tr_page(&o, x0, x1, y, foot_y - lh * 0.3f, pad);
+    LOCK(); s_hit.x0 = (int)x0; s_hit.x1 = (int)x1; s_hit.n = tr_shown() ? 0 : N_ROWS; UNLOCK();
+    if (tr_shown()) tr_page(&o, x0, x1, y, foot_y - lh * 0.3f, pad);
     char val[96];
-    for (int i = 0; i < N_ROWS && s_page != TR_PAGE; i++) {
+    for (int i = 0; i < N_ROWS && !tr_shown(); i++) {
         const int kind = k_rows[i].kind;
         const float h = kind == K_HEAD ? head_h : kind == K_GAP ? row_h * 0.5f : row_h;
         LOCK(); if (i < 32) { s_hit.y0[i] = (int)y; s_hit.y1[i] = (int)(y + h); } UNLOCK();
@@ -2180,6 +2273,7 @@ void rsx_host_ui_initial_window(int* w, int* h, unsigned* f) { *w = 1280; *h = 7
 int  rsx_host_ui_event(const union SDL_Event* e) { (void)e; return 0; }
 int  rsx_host_ui_capturing(void) { return 0; }
 void rsx_host_ui_request_menu(void) {}
+void rsx_host_ui_set_cheats(const rsx_cheat_api* api) { (void)api; }
 int  rsx_host_ui_visible(void) { return 0; }
 void rsx_host_ui_on_present(void) {}
 int  rsx_host_ui_font_for(rsx_ui_font* f, int w, int h) { (void)f; (void)w; (void)h; return 0; }

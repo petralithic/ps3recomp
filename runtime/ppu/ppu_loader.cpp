@@ -40,6 +40,14 @@
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
+/* The job manager line and its flags word, whose addresses depend on the disc (bss +0x100 on BCES00511). */
+#ifdef RACACIT_BCES00511
+#define RACACIT_JOBMGR_LINE 0x00F3CF18u
+#define RACACIT_JOBMGR_FLAGS 0x00F3D030u
+#else
+#define RACACIT_JOBMGR_LINE 0x00F3CE18u
+#define RACACIT_JOBMGR_FLAGS 0x00F3CF30u
+#endif
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "../platform/ps3_stdio.h"        /* ps3_stdio_init -- buffered stdout/stderr, timed flush */
 #ifndef _WIN32
@@ -1930,13 +1938,6 @@ extern "C" void ppu_inl_cfg_refresh(void)
         ppu_inl_cfg.base = v;
     }
 #endif
-#ifdef PPU_FIXED_VM_BASE
-    if (ppu_inl_cfg.base != (uint8_t*)(uintptr_t)(PPU_FIXED_VM_BASE) || ppu_inl_cfg.span != 0xDFFF0000ull) {
-        fprintf(stderr, "[ppu] fixed-base build, but the guest window is %p +0x%llX: refusing to run\n",
-                (void*)ppu_inl_cfg.base, (unsigned long long)ppu_inl_cfg.span);
-        abort();
-    }
-#endif
     fprintf(stderr, "[ppu] inline guest-memory window 0x%08X-0x%08X%s (GCM page 0x%08X)%c", ppu_inl_cfg.lo,
             (uint32_t)(ppu_inl_cfg.lo + ppu_inl_cfg.span), ppu_inl_cfg.span ? "" : " -- off (diagnostics)", hole, 10);
 }
@@ -2362,9 +2363,9 @@ static __attribute__((noinline, cold)) uint16_t vm_read16_slow(uint64_t a) { if 
           fprintf(stderr, "[HOTREAD16] spinning on 0x%08X val=0x%04X guest-fn=0x%08X\n", (uint32_t)a,
                   __builtin_bswap16(v), ppu_prof_resolve_host(__builtin_return_address(0)));
           { const char* ke = getenv("RACACIT_KICK_EXIT");   /* experiment: request job manager exit */
-            if (ke && (uint32_t)a == 0x00F3CE18u) { static int kicked = 0; if (!kicked++) {
-                uint32_t f; memcpy(&f, vm_base + 0xF3CF30, 4); f = __builtin_bswap32(f) | 0x40000000u;
-                f = __builtin_bswap32(f); memcpy(vm_base + 0xF3CF30, &f, 4);
+            if (ke && (uint32_t)a == RACACIT_JOBMGR_LINE) { static int kicked = 0; if (!kicked++) {
+                uint32_t f; memcpy(&f, vm_base + RACACIT_JOBMGR_FLAGS, 4); f = __builtin_bswap32(f) | 0x40000000u;
+                f = __builtin_bswap32(f); memcpy(vm_base + RACACIT_JOBMGR_FLAGS, &f, 4);
                 fprintf(stderr, "[racacit] KICK: set exit bit in F3CF30\n"); } } }
           if ((dumped < 3 && (dumped++, 1))) { uint32_t b = ((uint32_t)a & ~0xFu) - 0x20;
               for (int r = 0; r < 6; r++) { fprintf(stderr, "   %08X:", b + r*16);
@@ -3954,23 +3955,7 @@ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
 #define PS3_SC_INFLIGHT_MAX 64
 extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
 
-/* Title hook: every lv2 syscall's wall time, with its number and the guest lr
- * (game/stubs.cpp sets it for RACACIT_MAIN_STATS; NULL otherwise, one test). */
-extern "C" { void (*g_ppu_sc_time_hook)(ppu_context*, uint32_t num, unsigned long long us) = 0; }
-extern "C" void lv2_syscall_body(ppu_context* ctx);
 extern "C" void lv2_syscall(ppu_context* ctx)
-{
-    if (__builtin_expect(g_ppu_sc_time_hook != 0, 0)) {
-        extern unsigned long long ps3_qpc_us(void);
-        const uint32_t num = (uint32_t)ctx->gpr[11];
-        const unsigned long long t0 = ps3_qpc_us();
-        lv2_syscall_body(ctx);
-        g_ppu_sc_time_hook(ctx, num, ps3_qpc_us() - t0);
-        return;
-    }
-    lv2_syscall_body(ctx);
-}
-extern "C" void lv2_syscall_body(ppu_context* ctx)
 {
     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
      * waiting for a store watch to fire. Armed here because lv2_syscall runs

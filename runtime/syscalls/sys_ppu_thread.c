@@ -271,9 +271,6 @@ static void* ppu_host_thread_proc(void* param)
 {
     ppu_thread_info* info = (ppu_thread_info*)param;
     ps3_thread_name("ppu %s", info->name);
-#ifdef __APPLE__
-    { extern void racacit_thread_qos(const char*); racacit_thread_qos("PPU"); }
-#endif
 
 #ifdef _WIN32
     /* Reserve stack for the STACK_OVERFLOW handler, same as main() does for the
@@ -1373,7 +1370,7 @@ int64_t sys_ppu_thread_yield(ppu_context* ctx)
 #ifdef _WIN32
     SwitchToThread();
 #else
-    { extern void racacit_yield(void); racacit_yield(); }
+    sched_yield();
 #endif
     return CELL_OK;
 }

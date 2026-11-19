@@ -478,6 +478,37 @@ void rsx_draw_engine_write_topology_indices(u32 primitive, u32 source_refs,
                                             const u32* occurrence_to_unique,
                                             u32* indices);
 
+/* What a pipeline's shader text is generated from besides the two programs' bytes: the
+ * texture-derived masks, SHADER_CONTROL, the input layout mask, branch bits and alpha test.
+ * The Vulkan backend records it with the bytes (programlist.bin) while the game plays, and
+ * the shader prepare regenerates the text from it with the current translator, so a
+ * translator change rebuilds the cache instead of missing it. Bump the version when a
+ * field changes meaning (old records are then skipped). Same layout as the Android tree. */
+#define RSX_PROG_INPUTS_VERSION 2u
+typedef struct rsx_prog_inputs {
+    u32 version, fixed, vp_bytes, fp_bytes;
+    u32 vtex_mask, layout_mask, branch_bits;
+    u32 fp_ctrl, cube_mask, shadow_mask, biased_mask, dyn_tex, t3d, srgb_out;
+    u64 gamma_mask;
+    u32 alpha_test, alpha_func;
+    u32 unnorm_mask;
+    u32 unnorm_dim[16][3];       /* v2: width, height, depth (ps3recomp v0.19's 3D scale) */
+    u8  shadow_func[16];
+    u32 vol_mask, ucp, dbz;      /* v2: ps3recomp v0.19's volume units, user clip key, depth-bounds unit + 1 */
+    u32 wpos_grid[2];            /* v2: 0 unless WPOS is scaled */
+} rsx_prog_inputs;
+
+/* Set by the engine around each backend pipeline_create call (NULL otherwise). */
+extern const rsx_prog_inputs* rsx_draw_engine_cur_prog;
+extern const u8* rsx_draw_engine_cur_vp;
+extern const u8* rsx_draw_engine_cur_fp;
+
+/* The vertex and pixel shader text for `in` and its programs, as the engine builds it.
+ * *vi / *fi: the decompilers' results (> 0 ok); *nconst: the fragment constants it reads. */
+void rsx_draw_engine_gen_hlsl(const rsx_prog_inputs* in, const u8* vp, const u8* fp,
+                              char* vs, u32 vs_size, char* ps, u32 ps_size,
+                              int* vi, int* fi, u32* nconst, u32* dbz_bit);
+
 #ifdef __cplusplus
 }
 #endif

@@ -522,6 +522,15 @@ extern "C" void rsx_hlsl_to_spirv_cache_reset(void)
     s_mem_hits = s_file_hits = s_misses = 0;
 }
 
+/* Open (and if torn, rewrite) RSX_SHADER_CACHE's file now, before anything is
+ * translated: the shader prepare (RACACIT_PREPARE) reads it on its own handles
+ * and translates nothing itself. */
+extern "C" void rsx_hlsl_to_spirv_cache_open(void)
+{
+    std::lock_guard<std::mutex> g(s_mu);
+    if (!s_loaded) cache_load();
+}
+
 extern "C" int rsx_hlsl_to_spirv(const char* hlsl, int stage,
                                  u32* words, u32 max_words, u32* out_words,
                                  char* log, u32 log_size)
@@ -592,5 +601,6 @@ extern "C" void rsx_hlsl_to_spirv_cache_stats(RsxSpirvCacheStats* out)
 }
 
 extern "C" void rsx_hlsl_to_spirv_cache_reset(void) {}
+extern "C" void rsx_hlsl_to_spirv_cache_open(void) {}
 
 #endif

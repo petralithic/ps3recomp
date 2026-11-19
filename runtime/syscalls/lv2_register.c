@@ -751,9 +751,6 @@ static void* spu_exec_thread_proc(void* arg)
     spu_thread_t* t = (spu_thread_t*)arg;
     { const spu_group_t* g = spu_find_group(t->group_id);
       ps3_thread_name("spu %s:%u", g && g->name[0] ? g->name : "group", t->index); }
-#ifdef __APPLE__
-    { extern void racacit_thread_qos(const char*); racacit_thread_qos("SPU"); }
-#endif
     spu_lifted_thread_result r;
     spu_lifted_thread_run(t->sctx, &r);
     t->exit_status = r.exit_status;

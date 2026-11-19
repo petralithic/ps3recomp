@@ -166,6 +166,10 @@ int sceNpTrophyHostUnlock(int trophyId, const char* why);
 /* Called after every unlock (the game's or the host's), outside any lock,
  * on the unlocking thread. */
 void sceNpTrophySetUnlockHook(void (*hook)(int trophyId));
+/* A title's rule against unlocking (e.g. its cheats): when the gate returns
+ * nonzero no trophy unlocks -- the game's call answers "already unlocked"
+ * and the host's returns 1. Asked before every unlock, outside the lock. */
+void sceNpTrophySetUnlockGate(int (*gate)(void));
 
 #ifdef __cplusplus
 }

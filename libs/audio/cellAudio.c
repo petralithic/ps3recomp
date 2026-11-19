@@ -103,9 +103,6 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #define mutex_unlock(m)  LeaveCriticalSection(m)
 #else
   #include <pthread.h>
-  #ifdef __APPLE__
-  #include <pthread/qos.h>
-  #endif
   #include <unistd.h>
   #include <time.h>
   typedef pthread_t thread_t;
@@ -204,9 +201,6 @@ static volatile u8 s_port_done_seen[CELL_AUDIO_PORT_MAX];
 static float s_last_out[2];         /* the last frame sent to the device */
 static int   s_splice;              /* the next block does not follow the last one (a jump) */
 static unsigned s_late_skips, s_late_fades;   /* for the 30 s report */
-/* AUDIO_TRACE=1 (measurement): one line a second of what the output did. */
-static double s_tr_rmax = 1.0, s_tr_rmin = 1.0, s_tr_hmin = 1e9, s_tr_qmin = 1e9, s_tr_gap = 0.0;
-static unsigned s_tr_skips;
 
 /* ---------------------------------------------------------------------------
  * Host audio output backend
@@ -947,14 +941,6 @@ static void audio_put_hook(uint32_t ea, uint32_t lsa, uint32_t size)
             { static int s_b; if (!s_b) { s_b = 1; const char* e = getenv("RACACIT_AUDIO_BOOST"); const int lv = e ? atoi(e) : 1;
                 if (lv) SetThreadPriority(GetCurrentThread(), lv >= 2 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL);
                 fprintf(stderr, "[cellAudio] audio writer thread %lu, boost %d%c", (unsigned long)GetCurrentThreadId(), lv, 10); } }
-#elif defined(__APPLE__)
-            /* The same on Apple Silicon, where QoS decides P- or E-core: at the
-             * default class the job lost enough time under a 120 fps frame to
-             * finish 184-186 blocks a second, and the output stretched to make up
-             * the rest. Each thread that writes a block, once (SPURS moves jobs
-             * between lanes). RACACIT_AUDIO_BOOST=0 leaves the class alone. */
-            { static _Thread_local int s_b; if (!s_b) { s_b = 1; const char* e = getenv("RACACIT_AUDIO_BOOST");
-                if (!e || atoi(e)) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); } }
 #endif
             s_blk_done[p][blk] = 1; s_port_done_seen[p] = 1;
         }
@@ -1171,36 +1157,11 @@ static int audio_output_stretched(void)
     if (r > 1.8) r = 1.8;
     smooth += (r - smooth) * 0.1;
     if (r == 1.0 && fabs(smooth - 1.0) < 0.01) smooth = 1.0;
-    if (smooth > s_tr_rmax) s_tr_rmax = smooth;
-    if (smooth < s_tr_rmin) s_tr_rmin = smooth;
-    if (have < s_tr_hmin) s_tr_hmin = have;
-    { const double q = (double)audio_backend_queued_samples() / CELL_AUDIO_BLOCK_SAMPLES; if (q < s_tr_qmin) s_tr_qmin = q; }
     ast_set_ratio(&s_st, smooth);
     if (!ast_pull(&s_st, out, CELL_AUDIO_BLOCK_SAMPLES)) return 0;
     audio_wav_tap(out);
     if (s_sdl_audio_dev) SDL_QueueAudio(s_sdl_audio_dev, out, sizeof out);
     return 1;
-}
-#endif
-
-#if AUDIO_BACKEND_SDL2
-static void audio_trace(void)
-{
-    static int on = -1; if (on < 0) on = getenv("AUDIO_TRACE") ? 1 : 0;
-    if (!on) return;
-    static u64 t0, tl; static unsigned f0, p0, sk0; static unsigned long long st0, n0, d0, fd0;
-    const u64 t = audio_now_us();
-    if (tl && (double)(t - tl) > s_tr_gap) s_tr_gap = (double)(t - tl);
-    tl = t;
-    const unsigned fin = atomic_load_explicit(&s_finished[0], memory_order_relaxed);
-    if (!t0) { t0 = t; f0 = fin; p0 = s_pub_steps; st0 = s_st.stretched_steps; n0 = s_st.steps; d0 = s_st.dry_steps; fd0 = s_st.fades; return; }
-    if (t - t0 < 1000000ull) return;
-    const double sec = (double)(t - t0) / 1e6;
-    fprintf(stderr, "[audio-trace] t=%.1f fin=%.1f/s pub=%.1f/s steps=%llu str=%llu dry=%llu fades=%llu skipev=%u rmax=%.3f rmin=%.3f hmin=%.2f qmin=%.2f target=%u gap=%.1fms%c",
-            (double)t / 1e6, (fin - f0) / sec, (s_pub_steps >= p0 ? s_pub_steps - p0 : s_pub_steps) / sec, s_st.steps - n0, s_st.stretched_steps - st0,
-            s_st.dry_steps - d0, s_st.fades - fd0, s_late_skips >= sk0 ? s_late_skips - sk0 : s_late_skips, s_tr_rmax, s_tr_rmin, s_tr_hmin, s_tr_qmin, s_q_target, s_tr_gap / 1000.0, 10);
-    t0 = t; f0 = fin; p0 = s_pub_steps; st0 = s_st.stretched_steps; n0 = s_st.steps; d0 = s_st.dry_steps; fd0 = s_st.fades; sk0 = s_late_skips;
-    s_tr_rmax = s_tr_rmin = 1.0; s_tr_hmin = s_tr_qmin = 1e9; s_tr_gap = 0.0;
 }
 #endif
 
@@ -1210,9 +1171,8 @@ static void audio_mix_loop(void)
     printf("[cellAudio] Mixing thread started\n");
     /* It carries the clock the game's synth runs on (audio_pub_tick) and does
      * little else: a late wake here is a late read index for the whole game. */
-#if defined(__APPLE__)
-    { const char* e = getenv("RACACIT_AUDIO_BOOST");
-      if (!e || atoi(e)) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); }
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 #endif
 #if AUDIO_BACKEND_SDL2
     ast_init(&s_st);
@@ -1253,7 +1213,6 @@ static void audio_mix_loop(void)
         if (s_pub_mode) {
             audio_feed_stretcher();
             audio_late_report();
-            audio_trace();
             while (audio_backend_room() > 0 && audio_output_stretched()) {}
             audio_backend_wait();
             continue;

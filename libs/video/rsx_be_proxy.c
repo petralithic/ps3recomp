@@ -327,7 +327,7 @@ typedef struct { u32 v, surface, remap, rsx_format; } r_view;
 typedef struct { u32 v, w, h; } r_depth_create;
 typedef struct { u32 v, target, w, h, tw, th; } r_snap;
 typedef struct { u32 src, sx, sy, sw, sh, dst, dx, dy, dw, dh; } r_blit;
-typedef struct { u32 v; rsx_be_render_state rs; rsx_vertex_layout_plan layout; u32 stride; rsx_be_format rt_fmt; u32 rt_count; px_blob vs, ps; } r_pipe;
+typedef struct { u32 v; rsx_be_render_state rs; rsx_vertex_layout_plan layout; u32 stride; rsx_be_format rt_fmt; u32 rt_count; px_blob vs, ps, prog; } r_pipe;
 typedef struct { u32 count, depth, s[RSX_BE_MAX_COLOR_TARGETS]; } r_targets;
 typedef struct { u32 v; } r_one;
 typedef struct { float units, factor; } r_bias;
@@ -384,9 +384,18 @@ static void px_replay(const u8* rec)
         if (!s_real->blit(u, tr(a->src), a->sx, a->sy, a->sw, a->sh, tr(a->dst), a->dx, a->dy, a->dw, a->dh)) s_blit_fails++;
         break; }
     case OP_PIPE_CREATE: { const r_pipe* a = (const void*)b;
+        /* The engine's program record travels with the call (rsx_draw_engine_cur_prog). */
+        const u8* pg = (const u8*)px_blob_ptr(rec, &a->prog);
+        if (pg) {
+            const rsx_prog_inputs* in = (const rsx_prog_inputs*)pg;
+            rsx_draw_engine_cur_prog = in;
+            rsx_draw_engine_cur_vp = in->fixed ? NULL : pg + sizeof *in;
+            rsx_draw_engine_cur_fp = in->fixed ? NULL : pg + sizeof *in + in->vp_bytes;
+        }
         s_v2r[a->v] = s_real->pipeline_create(u, (const char*)px_blob_ptr(rec, &a->vs), (const char*)px_blob_ptr(rec, &a->ps),
                                               &a->rs, &a->layout, a->stride, a->rt_fmt, a->rt_count);
-        free(a->vs.heap); free(a->ps.heap); break; }
+        rsx_draw_engine_cur_prog = NULL; rsx_draw_engine_cur_vp = rsx_draw_engine_cur_fp = NULL;
+        free(a->vs.heap); free(a->ps.heap); free(a->prog.heap); break; }
     case OP_PIPE_RELEASE: { const r_release* a = (const void*)b; s_real->pipeline_release(u, tr(a->v)); s_v2r[a->v] = 0; break; }
     case OP_BIND_TARGETS: { const r_targets* a = (const void*)b; u32 s[RSX_BE_MAX_COLOR_TARGETS];
         for (u32 i = 0; i < a->count && i < RSX_BE_MAX_COLOR_TARGETS; i++) s[i] = tr(a->s[i]);
@@ -626,13 +635,28 @@ static u32 p_pipe_create(void* user, const char* vs, const char* ps, const rsx_b
 {
     (void)user; if (!vs || !ps || !rs || !layout) return 0;
     const u32 v = v_alloc(); if (!v) return 0;
-    const void* d[2] = { vs, ps }; const u32 sz[2] = { (u32)strlen(vs) + 1u, (u32)strlen(ps) + 1u };
-    px_blob bl[2]; u32 n;
-    u8* rec = px_begin(OP_PIPE_CREATE, sizeof(r_pipe), d, sz, 2, bl, &n);
+    /* The engine's program record (inputs + both programs' bytes), copied now: the guest's
+     * program memory may change before the render thread gets to the call. */
+    const rsx_prog_inputs* in = rsx_draw_engine_cur_prog;
+    u8* pg = NULL; u32 pgn = 0;
+    if (in && (in->fixed || (rsx_draw_engine_cur_vp && rsx_draw_engine_cur_fp))) {
+        const u32 vb = in->fixed ? 0u : in->vp_bytes, fb = in->fixed ? 0u : in->fp_bytes;
+        pgn = (u32)sizeof *in + vb + fb;
+        pg = (u8*)malloc(pgn);
+        if (pg) {
+            memcpy(pg, in, sizeof *in);
+            if (vb) memcpy(pg + sizeof *in, rsx_draw_engine_cur_vp, vb);
+            if (fb) memcpy(pg + sizeof *in + vb, rsx_draw_engine_cur_fp, fb);
+        } else pgn = 0;
+    }
+    const void* d[3] = { vs, ps, pg }; const u32 sz[3] = { (u32)strlen(vs) + 1u, (u32)strlen(ps) + 1u, pgn };
+    px_blob bl[3]; u32 n;
+    u8* rec = px_begin(OP_PIPE_CREATE, sizeof(r_pipe), d, sz, 3, bl, &n);
     r_pipe* a = (r_pipe*)(rec + sizeof(px_hdr));
     a->v = v; a->rs = *rs; a->layout = *layout; a->stride = stride; a->rt_fmt = rt_fmt; a->rt_count = rt_count;
-    a->vs = bl[0]; a->ps = bl[1];
+    a->vs = bl[0]; a->ps = bl[1]; a->prog = bl[2];
     px_commit(rec, n);
+    free(pg);
     return v;
 }
 static void p_pipe_release(void* user, u32 p) { (void)user; if (!p) return; PX_SIMPLE(OP_PIPE_RELEASE, r_release, p); v_free(p); }

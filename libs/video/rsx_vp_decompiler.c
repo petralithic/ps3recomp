@@ -67,16 +67,33 @@ u32 rsx_vp_program_size_instrs(const u8* ucode, u32 max_bytes)
 
 /* ---- output appender --------------------------------------------------- */
 typedef struct { char* p; u32 cap; u32 len; int overflow; } Out;
+/* Exact (Dot2) dot products in every program, or only where they reach the
+ * position. Apple: the slice by default (RSX_VP_EXACT_DOTS=1 keeps every dot
+ * exact). Elsewhere: every dot exact, the shader text unchanged, unless
+ * RSX_VP_EXACT_DOTS=0 turns the slice on. */
+static int vp_all_exact_dots(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("RSX_VP_EXACT_DOTS");
+#if defined(__APPLE__)
+        v = e && *e == '1';
+#else
+        v = !(e && *e == '0');
+#endif
+    }
+    return v;
+}
+
 /* Apple: no `precise` (SPIR-V NoContraction) in the vertex programs.
  * SPIRV-Cross, inside MoltenVK, implements it by calling an optnone helper
- * (spvFAdd/spvFSub/spvFMul) for every add, subtract and multiply, a median
- * of 260 calls per vertex program here, and those calls were most of the
- * GPU's frame (Zolar Forest: fence waits ~1.2 s per 120 frames -> ~0.1 s).
- * The exact dots (vp_dot3/vp_dot4) stay exact without it on Apple GPUs: the
- * product error is an explicit fma (mad), and Metal's compiler neither fused
- * p + a*b nor reordered the TwoSum terms in any math mode (checked: 1M
- * cases where fusing would change the sum, fast, relaxed and safe modes).
- * RSX_VP_PRECISE=1 keeps `precise`. */
+ * (spvFAdd/spvFSub/spvFMul) for every add, subtract and multiply -- a median
+ * of 260 calls per vertex program in A Crack in Time -- and those calls were
+ * most of the GPU's frame. The exact dots (vp_dot3/vp_dot4) stay exact
+ * without it on Apple GPUs: the product error is an explicit fma (mad), and
+ * Metal's compiler neither fused p + a*b nor reordered the TwoSum terms in
+ * any math mode (checked on 1M cases where fusing would change the sum,
+ * fast, relaxed and safe). RSX_VP_PRECISE=1 keeps `precise`. */
 static int vp_keep_precise(void)
 {
 #if defined(__APPLE__)
@@ -394,13 +411,14 @@ static int rsx_vp_decompile_impl(
      * coordinates, colours -- gets the plain sum of the same products (0*x
      * rule kept), about a tenth of the work. A backward slice from the writes
      * to o[0] over the temps; programs with flow control or condition codes
-     * keep the exact form everywhere. RSX_VP_EXACT_DOTS=1 restores it for
-     * all programs. */
+     * keep the exact form everywhere. On by default on Apple only (measured
+     * there); elsewhere RSX_VP_EXACT_DOTS=0 turns it on -- off, the shader
+     * text is exactly what it was, so no shader cache is invalidated.
+     * RSX_VP_EXACT_DOTS=1 keeps the exact form everywhere on Apple too. */
     static u8 exact_dot[RSX_VP_MAX_INSTR + 1];
     memset(exact_dot, 1, sizeof exact_dot);
     {
-        static int all_exact = -1;
-        if (all_exact < 0) { const char* e = getenv("RSX_VP_EXACT_DOTS"); all_exact = e && *e == '1'; }
+        const int all_exact = vp_all_exact_dots();
         u32 rd[RSX_VP_MAX_INSTR][2], vt[RSX_VP_MAX_INSTR], st[RSX_VP_MAX_INSTR];
         u8 vpos[RSX_VP_MAX_INSTR], spos[RSX_VP_MAX_INSTR], vfull[RSX_VP_MAX_INSTR], sfull[RSX_VP_MAX_INSTR];
         int n = 0, simple = !has_flow && !all_exact, sees_pos = 0;
@@ -742,11 +760,10 @@ static int rsx_vp_decompile_impl(
          * which Vulkan requires correctly rounded -- an FMA (mad) need not be
          * fused there, and an unfused one would make the error term wrong. */
 #ifdef __APPLE__
-        /* HLSL mad becomes SPIR-V Fma and then Metal fma(), which is fused
-         * with a single rounding on every Apple GPU,
-         * so the exact product error is one instruction there instead of the
-         * Veltkamp split below. Same result; the split cost about a third of
-         * the frame in vertex-heavy scenes through MoltenVK. */
+        /* HLSL mad becomes SPIR-V Fma and then Metal fma(), which Metal
+         * defines as correctly rounded, so the exact product error is one
+         * instruction instead of the Veltkamp split below. Same result; the
+         * split more than halved forest frame rates through MoltenVK. */
         "float vp_mul_err(float a, float b, float p) {\n"
         "    precise float e = mad(a, b, -p);\n"
         "    return (a == 0.0 || b == 0.0) ? 0.0 : e; }\n"
@@ -763,9 +780,7 @@ static int rsx_vp_decompile_impl(
         "    precise float t = p + h; precise float z = t - p;\n"
         "    precise float q = (p - (t - z)) + (h - z);\n"
         "    p = t; precise float s2 = s + (q + r); s = s2; }\n"
-        /* The plain forms, for dots that never reach the position. */
-        "float vp_dot3f(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z; }\n"
-        "float vp_dot4f(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z + m.w; }\n"
+
         "float vp_dot3(float4 a, float4 b) {\n"
         "    precise float p = vp_mul1(a.x, b.x); precise float s = vp_mul_err(a.x, b.x, p);\n"
         "    vp_dot_step(p, s, a.y, b.y); vp_dot_step(p, s, a.z, b.z);\n"
@@ -778,6 +793,12 @@ static int rsx_vp_decompile_impl(
         "    precise float d = p + s;\n"
         "    float4 m = vp_mul(a, b); precise float plain = m.x + m.y + m.z + m.w;\n"
         "    return isfinite(d) ? d : plain; }\n");
+    /* The plain forms, for dots that never reach the position (only when
+     * the exact form is not kept everywhere: see vp_all_exact_dots). */
+    if (!vp_all_exact_dots())
+        emit(&o,
+        "float vp_dot3f(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z; }\n"
+        "float vp_dot4f(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z + m.w; }\n");
 
     for (u32 vtu = 0; vtu < 4; vtu++) {
         if (!((vtex_mask >> vtu) & 1u)) continue;

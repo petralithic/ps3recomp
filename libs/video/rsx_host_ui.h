@@ -228,6 +228,28 @@ void rsx_host_ui_poll_script(void);
 /* A pending "shot" request: copies its path into `out` (render worker). */
 int rsx_host_ui_take_shot(char* out, int n);
 
+/* ---------------------------------------------------------------------------
+ * The cheat menu (RACACIT_CHEATS=1, the launcher's Settings > Game): a
+ * "Cheats" page where the Trophies page is. The title supplies what it does
+ * (game/stubs.cpp); calls come from the menu's thread and only queue work
+ * the title does on its own thread.
+ * -------------------------------------------------------------------------*/
+enum { RSX_CHEAT_BOLTS = 1,      /* arg: bolts to add */
+       RSX_CHEAT_WEAPON_UP,      /* arg: weapon id, one level up */
+       RSX_CHEAT_WEAPONS_MAX,    /* every weapon owned to its top level */
+       RSX_CHEAT_WEAPONS_RESET,  /* every weapon owned back to level 1 */
+       RSX_CHEAT_GOD,            /* arg: 1 on, 0 off */
+       RSX_CHEAT_GO };           /* arg: destination index */
+typedef struct rsx_cheat_api {
+    int  (*weapons)(int* ids, int max);   /* weapons owned that have levels: their ids */
+    int  (*weapon)(int id, char* name, int n, int* level, int* top);   /* 0-based level and top */
+    int  (*n_dests)(void);
+    const char* (*dest)(int i);
+    void (*command)(int cmd, int arg);
+    int  (*god)(void);
+} rsx_cheat_api;
+void rsx_host_ui_set_cheats(const rsx_cheat_api* api);
+
 #ifdef __cplusplus
 }
 #endif

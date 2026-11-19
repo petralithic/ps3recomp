@@ -96,6 +96,7 @@ static const char* dlerror(void)
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ---------------------------------------------------------------------------
  * Run-time loaded entry points (Vulkan 1.0 core only)
@@ -352,10 +353,6 @@ static int vk_load_wsi_device_functions(void)
  * beyond VK_ERROR_DEVICE_LOST. */
 static PFN_vkGetDeviceFaultInfoEXT pvkGetDeviceFaultInfoEXT;
 static int s_vk_pcc;   /* VK_EXT_pipeline_creation_cache_control on: vk_eng_variant compiles new pipelines in the background */
-/* macOS: the thread that owns the window (the process main thread) pumps
- * events from inside long work too -- renderer init, pipeline builds -- so
- * the window server never sees it stop answering (the beach ball). */
-static void vk_keep_responsive(void);
 static void vk_device_lost_report(VkResult r)
 {
     static int done;
@@ -676,10 +673,6 @@ static void vk_pool_shutdown(void)
  * blocks' total and their count. A block goes back to the driver only when
  * nothing in it is live, so blocks that keep being added while `live` stays
  * well below the total means pieces scattered over them (fragmentation). */
-/* Vulkan object creations so far (the RSX_ENG_STATS counters: 0 image,
- * 1 memory, 2 framebuffer, 3 sampler, 4 view, 5 pipeline, 6 buffer); they
- * only reset when RSX_ENG_STATS prints. For per-frame hitch attribution. */
-unsigned long long rsx_vk_create_count(int k) { return (k >= 0 && k < 8) ? s_vkc[k] : 0; }
 void rsx_vk_pool_stats(unsigned long long* live, unsigned long long* cap, unsigned* blocks)
 {
     unsigned long long l = 0; unsigned n = 0;
@@ -1150,10 +1143,6 @@ static void vk_bt_end_pass(void)
 
 /* Everything recorded before is ordered before everything after: the
  * guarantee the old submit-and-wait gave between any two operations. */
-/* Set while transfer-only work (copies, clears, uploads) is being recorded:
- * vk_barrier_image then makes only the transfer stage wait. What reads the
- * result starts a render pass, and vk_pass_barrier orders that. */
-static int s_xfer_scope;
 static void vk_full_barrier(void)
 {
     VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -1171,12 +1160,20 @@ static void vk_full_barrier(void)
  * textures would need the full barrier, but draws whose vertex program samples
  * one do not reach this path (vk_eng_pipeline drops them). Measured on an M1
  * Pro in Zolar Forest: 74 full barriers a frame, 46 of them here; with this,
- * 49.0 -> 52.3 FPS. RSX_PASS_BARRIER=full restores the full barrier. */
+ * 49.0 -> 52.3 FPS. On by default on Apple only, where it was measured;
+ * elsewhere RSX_PASS_BARRIER=narrow turns it on, and RSX_PASS_BARRIER=full
+ * restores the full barrier on Apple. */
 static void vk_pass_barrier(void)
 {
     static int full = -1;
-    if (full < 0) { const char* e = getenv("RSX_PASS_BARRIER"); full = e && !strcmp(e, "full"); }
-    s_xfer_scope = 0;
+    if (full < 0) {
+        const char* e = getenv("RSX_PASS_BARRIER");
+#if defined(__APPLE__)
+        full = e && !strcmp(e, "full");
+#else
+        full = !(e && !strcmp(e, "narrow"));
+#endif
+    }
     if (full) { vk_full_barrier(); return; }
     VkMemoryBarrier mb[2] = {
         { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
@@ -1353,24 +1350,7 @@ static int vk_begin(void)
     }
     if (vk_bt_open()) return -1;
     vk_bt_end_pass();
-    s_xfer_scope = 0;
     vk_full_barrier();
-    return 0;
-}
-/* vk_begin for transfer-only work (copies, clears, uploads): see s_xfer_scope.
- * RSX_PASS_BARRIER=full keeps the full barrier. */
-static int vk_begin_xfer(void)
-{
-    static int full = -1;
-    if (full < 0) { const char* e = getenv("RSX_PASS_BARRIER"); full = e && !strcmp(e, "full"); }
-    if (full || !s_bt.ready) return vk_begin();
-    if (vk_bt_open()) return -1;
-    vk_bt_end_pass();
-    s_xfer_scope = 1;
-    VkMemoryBarrier mb = { .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
-                           .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT };
-    pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                          0, 1, &mb, 0, NULL, 0, NULL);
     return 0;
 }
 
@@ -1407,8 +1387,7 @@ static void vk_barrier_image(VkImage img, VkImageAspectFlags aspect, VkImageLayo
                                             VK_REMAINING_ARRAY_LAYERS },
     };
     pvkCmdPipelineBarrier(s_vk.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                          s_xfer_scope ? VK_PIPELINE_STAGE_TRANSFER_BIT : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                          0, 0, NULL, 0, NULL, 1, &b);
+                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1457,7 +1436,7 @@ static int vk_upload_texture_levels(vk_image* dst, const u8* rgba,
                                VK_IMAGE_ASPECT_COLOR_BIT)) {
         vk_destroy_image(&fresh); vk_destroy_buffer(&staging); return -1;
     }
-    int rc = vk_begin_xfer();
+    int rc = vk_begin();
     if (!rc) {
         vk_barrier_image(fresh.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
         pvkCmdCopyBufferToImage(s_vk.cmd, staging.buf, fresh.img, VK_IMAGE_LAYOUT_GENERAL,
@@ -2215,38 +2194,55 @@ static void vk_guest_tri(const rsx_state* st, u32 i0, u32 i1, u32 i2)
  * already seen in the background (vk_plist_open, by the engine's pipelines). */
 static void vk_plist_open(int rebuild);
 static void vk_plist_close(void);
-static SDL_atomic_t s_pw_dirty;          /* the pre-warm built pipelines: save the cache */
-static void* s_pw_blob; static size_t s_pw_blob_n;   /* vk_prewarm_thread */
-static VkPipelineCache s_pw_cache[8];      /* the pre-warm workers' own (keep mode) */
-static volatile int s_pw_merge;            /* 1: the workers are done, their caches wait for vk_ap_merge */
-/* macOS: MoltenVK's pipeline cache holds MSL, and creating a cache from a
- * file compiles every Metal library in it, one after another, before
- * vkCreatePipelineCache returns: 53 s for a 15 MB file on an M1 Pro, on the
- * window's thread (the beach ball at every start, growing as the file
- * grows). So on macOS the file is neither loaded nor saved unless
- * RSX_PIPELINE_CACHE_LOAD=1; the pre-warm builds the listed variants from
- * RSX_PIPELINE_LIST on background threads instead (vk_prewarm_thread). */
-static int vk_pcache_file_on(void)
+static void vk_prog_open(void);
+static void vk_prog_close(void);
+
+/* RACACIT_PREPARE=1 (the launcher's "Prepare shaders"): main.cpp brings Vulkan
+ * up without the game and calls rsx_vulkan_prepare_shaders, which builds every
+ * listed pipeline variant on all cores into the pipeline cache and exits. */
+static int vk_prepare_mode(void)
 {
     static int on = -1;
-    if (on < 0) {
-        const char* e = getenv("RSX_PIPELINE_CACHE_LOAD");
-#ifdef __APPLE__
-        on = e && *e == '1';
-#else
-        on = !(e && *e == '0');
-#endif
-    }
+    if (on < 0) { const char* e = getenv("RACACIT_PREPARE"); on = e && *e == '1'; }
     return on;
 }
 
+/* <the pipeline cache's folder>/<name> into out; 0 when there is no cache path. */
+static int vk_cache_sibling(char* out, size_t cap, const char* name)
+{
+    const char* pc = getenv("RSX_PIPELINE_CACHE");
+    if (!pc || !*pc) return 0;
+    snprintf(out, cap, "%s", pc);
+    char* sl = strrchr(out, '/');
+    char* bs = strrchr(out, '\\');
+    if (bs && (!sl || bs > sl)) sl = bs;
+    if (!sl) return 0;
+    snprintf(sl + 1, cap - (size_t)(sl + 1 - out), "%s", name);
+    return 1;
+}
+
+/* <cache folder>/shaders.state, for the launcher: what this start found in the
+ * pipeline cache -- ok, empty, or refused (another driver built it: a driver
+ * update, so the shaders want preparing again). */
+static void vk_shaders_state(const char* what)
+{
+    char path[1100];
+    if (!vk_cache_sibling(path, sizeof path, "shaders.state")) return;
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    VkPhysicalDeviceProperties p;
+    pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+    fprintf(f, "cache=%s\ndriver=", what);
+    for (int i = 0; i < VK_UUID_SIZE; i++) fprintf(f, "%02x", p.pipelineCacheUUID[i]);
+    fprintf(f, "\ndriver_version=%u\ngpu=%s\n", p.driverVersion, p.deviceName);
+    fclose(f);
+}
+static SDL_atomic_t s_pw_dirty;          /* the pre-warm built pipelines: save the cache */
 static void vk_pcache_init(void)
 {
     const char* path = getenv("RSX_PIPELINE_CACHE");
     void* data = NULL; size_t n = 0;
-    if (path && *path && !vk_pcache_file_on())
-        VK_LOG("pipeline cache: %s not loaded (RSX_PIPELINE_CACHE_LOAD=1 loads it; MoltenVK compiles all of it up front)\n", path);
-    if (path && *path && vk_pcache_file_on()) {
+    if (path && *path) {
         FILE* f = fopen(path, "rb");
         if (f) {
             fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
@@ -2265,7 +2261,6 @@ static void vk_pcache_init(void)
             fclose(f);
         }
     }
-    vk_keep_responsive();
     VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
                                      .initialDataSize = n, .pInitialData = n ? data : NULL };
     int rebuild = n == 0;                                    /* nothing to start from */
@@ -2275,7 +2270,7 @@ static void vk_pcache_init(void)
         if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_g.pcache) != VK_SUCCESS)
             s_g.pcache = VK_NULL_HANDLE;
     }
-    if (path && *path && vk_pcache_file_on()) VK_LOG("pipeline cache: %s, %zu bytes loaded\n", path, n);
+    if (path && *path) VK_LOG("pipeline cache: %s, %zu bytes loaded\n", path, n);
     /* The header names the driver that built it (32 bytes: size, version,
      * vendor, device, pipelineCacheUUID); a driver update changes the UUID and
      * the driver then ignores the whole file without a word -- every pipeline
@@ -2290,10 +2285,11 @@ static void vk_pcache_init(void)
             rebuild = 1;
         }
     }
-    if (n && data) { s_pw_blob = data; s_pw_blob_n = n; }   /* the pre-warm's caches start from it (vk_plist_open frees it otherwise) */
-    else free(data);
+    vk_shaders_state(n == 0 ? "empty" : rebuild ? "refused" : "ok");
+    free(data);
     { const char* s = getenv("RSX_PIPELINE_SALT"); s_g.pcache_salt = s ? (u32)strtoul(s, NULL, 0) : 0u; }
     if (s_g.pcache) vk_plist_open(rebuild);                  /* and the pre-warm, if needed */
+    vk_prog_open();
 }
 
 /* The save runs on a thread of its own: fetching an 18 MB cache from the
@@ -2333,7 +2329,7 @@ static void vk_pcache_save(int force)
     static const char* path = (const char*)-1;
     if (path == (const char*)-1) path = getenv("RSX_PIPELINE_CACHE");
     if (SDL_AtomicSet(&s_pw_dirty, 0)) s_g.pcache_dirty++;
-    if (!s_g.pcache || !s_g.pcache_dirty || !path || !*path || !vk_pcache_file_on()) return;
+    if (!s_g.pcache || !s_g.pcache_dirty || !path || !*path) return;
     const unsigned long long now = ps3_qpc_us();
     if (!force && now - s_last < 5000000ull) return;      /* batch a burst of builds */
     if (!SDL_AtomicCAS(&s_pcache_busy, 0, 1)) return;     /* one save at a time */
@@ -2420,6 +2416,7 @@ static int vk_guest_init(void)
 static void vk_guest_shutdown(void)
 {
     vk_plist_close();                    /* stops the pre-warm: it uses the layout below */
+    vk_prog_close();
     if (s_vk.device) {
         for (u32 i = 0; i < s_g.pipe_count; i++)
             if (s_g.pipes[i].pipe) pvkDestroyPipeline(s_vk.device, s_g.pipes[i].pipe, NULL);
@@ -3837,14 +3834,7 @@ static void vk_cb_present(void* ud, u32 buffer_id)
         static long s_every = -1;
         if (s_every < 0) { const char* e = getenv("PS3RECOMP_VK_DUMP_EVERY");
                            s_every = e ? atol(e) : 1; if (s_every < 1) s_every = 1; }
-        int dump_this = s_vk.dump_path && (s_vk.presented % (u32)s_every) == 0;
-        /* PS3RECOMP_VK_DUMP_GATE: decide before the readback, not after it --
-         * a closed gate otherwise still pays a full-frame GPU copy and wait. */
-        if (dump_this) {
-            static const char* gate = (const char*)1;
-            if (gate == (const char*)1) gate = getenv("PS3RECOMP_VK_DUMP_GATE");
-            if (gate) { FILE* gf = fopen(gate, "rb"); if (!gf) dump_this = 0; else fclose(gf); }
-        }
+        const int dump_this = s_vk.dump_path && (s_vk.presented % (u32)s_every) == 0;
         if (!dump_this && (s_vk.windowed || s_vk.dump_path)) {
             s_vk.presented++;
             s_g.last_draws = s_g.draws;
@@ -4287,7 +4277,7 @@ static u32 vk_eng_depth_target_create(void* user, u32 w, u32 h)
     o->sc = zsc;
     if (zsc > 0.0f) s_zhi_made++;
     /* Far plane, for the reason the display depth starts there. */
-    if (vk_begin_xfer()) { vk_eng_release(user, hd); return 0; }
+    if (vk_begin()) { vk_eng_release(user, hd); return 0; }
     vk_barrier_image(o->im.img, s_vk.eng_depth_aspect, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
     VkImageSubresourceRange r = { s_vk.eng_depth_aspect, 0, 1, 0, 1 };
@@ -4315,7 +4305,7 @@ static void vk_eng_clear_color(void* user, u32 surface, const float rgba[4])
                       ((u32)(rgba[1] * 255.0f + 0.5f) <<  8) |
                        (u32)(rgba[2] * 255.0f + 0.5f);
     vk_eng_obj* o = vk_eng_get(surface, VK_ENG_COLOR);
-    if (!o || vk_begin_xfer()) return;
+    if (!o || vk_begin()) return;
     VkClearColorValue v;
     memcpy(v.float32, rgba, sizeof v.float32);
     VkImageSubresourceRange r = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
@@ -4333,7 +4323,7 @@ static void vk_eng_clear_depth_stencil(void* user, u32 depth, u32 flags,
     if (flags & RSX_BE_CLEAR_DEPTH) clr |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if ((flags & RSX_BE_CLEAR_STENCIL) && (s_vk.eng_depth_aspect & VK_IMAGE_ASPECT_STENCIL_BIT))
         clr |= VK_IMAGE_ASPECT_STENCIL_BIT;
-    if (!o || !clr || vk_begin_xfer()) return;
+    if (!o || !clr || vk_begin()) return;
     VkClearDepthStencilValue d = { depth_value, stencil };
     VkImageSubresourceRange r = { clr, 0, 1, 0, 1 };
     vk_barrier_image(o->im.img, s_vk.eng_depth_aspect, VK_IMAGE_LAYOUT_GENERAL);
@@ -4595,12 +4585,12 @@ static u32 vk_eng_color_snapshot(void* user, u32 color, u32 w, u32 h)
         t->kind = VK_ENG_TEXTURE; t->fmt = c->fmt; t->bpp = c->bpp; t->w = w; t->h = h;
         t->lw = lw; t->lh = lh;
         c->surface = snap;
-        if (vk_begin_xfer()) return 0;
+        if (vk_begin()) return 0;
         vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
         if (vk_defer()) return 0;
     }
     t->lw = lw; t->lh = lh;
-    if (vk_begin_xfer()) return 0;
+    if (vk_begin()) return 0;
     vk_barrier_image(c->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     vk_barrier_image(t->im.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
     VkImageCopy rg = { .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
@@ -4956,14 +4946,6 @@ static struct {
  * destination, so not while the pre-warm builds into it. */
 static void vk_ap_merge(void)
 {
-    if (s_pw_merge == 1) {                     /* render thread: the only user of the main cache */
-        SDL_MemoryBarrierAcquire();
-        u32 m = 0;
-        for (u32 i = 0; i < 8; i++) if (s_pw_cache[i]) s_pw_cache[m++] = s_pw_cache[i];
-        if (m && pvkMergePipelineCaches(s_vk.device, s_g.pcache, m, s_pw_cache) == VK_SUCCESS) s_g.pcache_dirty++;
-        for (u32 i = 0; i < m; i++) { pvkDestroyPipelineCache(s_vk.device, s_pw_cache[i], NULL); s_pw_cache[i] = VK_NULL_HANDLE; }
-        s_pw_merge = 2;
-    }
     if (!s_ap.cache || s_ap.merged == s_ap.built || s_pw_running) return;
     if (pvkMergePipelineCaches(s_vk.device, s_g.pcache, 1, &s_ap.cache) == VK_SUCCESS) s_ap.merged = s_ap.built;
 }
@@ -5231,6 +5213,163 @@ static int vk_eng_translate(const char* hlsl, int stage, VkShaderModule* out, u6
     return pvkCreateShaderModule(s_vk.device, &ci, NULL, out) == VK_SUCCESS ? 0 : -1;
 }
 
+/* ---- programlist.bin: what each pipeline's shader text was generated from ----
+ * RSX_PROGRAM_LIST=<file> (main.cpp: programlist.bin next to the exe): each new program pair the engine
+ * builds a pipeline from -- its rsx_prog_inputs and both programs' bytes, with
+ * the SPIR-V hashes the text translated to then -- appended once
+ * ("RSXPRG01", then records { u32 bytes, vk_prog_hdr, vp bytes, fp bytes,
+ * u32 check }). The shader prepare regenerates the text from these with the
+ * current translator: where a program's SPIR-V changed (a shader-text change
+ * in a new build), pipelinelist.bin is remapped to the new programs before its
+ * variants are built, so the cache follows the text instead of missing it. */
+#define VK_PROG_MAX_BYTES (64u << 20)
+static const char kProgMagic[8] = { 'R', 'S', 'X', 'P', 'R', 'G', '0', '2' };
+
+typedef struct vk_prog_hdr {
+    u64 key;                  /* vk_fnv1a64 of inputs + bytes: one record per program pair */
+    u64 vs_hash, fs_hash;     /* their SPIR-V when recorded (vk_spv_hash) */
+    u32 vs_words, fs_words;
+    rsx_prog_inputs in;
+} vk_prog_hdr;
+
+static struct {
+    FILE* f;
+    u64*  seen;
+    u32   cap, n;
+    long  bytes;
+} s_pg;
+
+static int vk_pg_seen(u64 k)
+{
+    if (2u * (s_pg.n + 1u) > s_pg.cap) {
+        const u32 cap = s_pg.cap ? s_pg.cap * 2u : 4096u;
+        u64* t = (u64*)calloc(cap, sizeof *t);
+        if (!t) return 1;
+        for (u32 i = 0; i < s_pg.cap; i++) {
+            if (!s_pg.seen[i]) continue;
+            u32 j = (u32)(s_pg.seen[i] ^ (s_pg.seen[i] >> 32)) & (cap - 1u);
+            while (t[j]) j = (j + 1u) & (cap - 1u);
+            t[j] = s_pg.seen[i];
+        }
+        free(s_pg.seen); s_pg.seen = t; s_pg.cap = cap;
+    }
+    u32 j = (u32)(k ^ (k >> 32)) & (s_pg.cap - 1u);
+    while (s_pg.seen[j]) { if (s_pg.seen[j] == k) return 1; j = (j + 1u) & (s_pg.cap - 1u); }
+    s_pg.seen[j] = k; s_pg.n++;
+    return 0;
+}
+
+static u64 vk_prog_key(const rsx_prog_inputs* in, const u8* vp, const u8* fp)
+{
+    u64 k = vk_fnv1a64(in, sizeof *in, 1469598103934665603ull);
+    if (vp && in->vp_bytes) k = vk_fnv1a64(vp, in->vp_bytes, k);
+    if (fp && in->fp_bytes) k = vk_fnv1a64(fp, in->fp_bytes, k);
+    return k ? k : 1u;
+}
+
+/* One record from f at its current position: 1 read, 0 end, -1 torn. *vp / *fp point
+ * into buf (cap bytes). */
+static int vk_prog_read(FILE* f, vk_prog_hdr* h, u8* buf, u32 cap, const u8** vp, const u8** fp)
+{
+    u32 len = 0;
+    if (fread(&len, 4, 1, f) != 1) return 0;
+    if (len < sizeof *h + 4u || len - sizeof *h - 4u > cap) return -1;
+    if (fread(h, sizeof *h, 1, f) != 1) return -1;
+    const u32 nb = len - (u32)sizeof *h - 4u;
+    u32 check = 0;
+    if ((nb && fread(buf, 1, nb, f) != nb) || fread(&check, 4, 1, f) != 1) return -1;
+    if (h->in.vp_bytes + h->in.fp_bytes != nb) return -1;
+    u32 c = vk_fnv1a32((const u8*)h, (u32)sizeof *h);
+    for (u32 i = 0; i < nb; i++) { c ^= buf[i]; c *= 16777619u; }
+    if (c != check) return -1;
+    *vp = buf; *fp = buf + h->in.vp_bytes;
+    return 1;
+}
+
+static void vk_prog_write(FILE* f, const vk_prog_hdr* h, const u8* vp, const u8* fp)
+{
+    const u32 nb = h->in.vp_bytes + h->in.fp_bytes;
+    const u32 len = (u32)sizeof *h + nb + 4u;
+    u32 c = vk_fnv1a32((const u8*)h, (u32)sizeof *h);
+    for (u32 i = 0; i < h->in.vp_bytes; i++) { c ^= vp[i]; c *= 16777619u; }
+    for (u32 i = 0; i < h->in.fp_bytes; i++) { c ^= fp[i]; c *= 16777619u; }
+    fwrite(&len, 4, 1, f);
+    fwrite(h, sizeof *h, 1, f);
+    if (h->in.vp_bytes) fwrite(vp, 1, h->in.vp_bytes, f);
+    if (h->in.fp_bytes) fwrite(fp, 1, h->in.fp_bytes, f);
+    fwrite(&c, 4, 1, f);
+}
+
+/* vk_pcache_init: index the file (a torn tail is cut off) and keep it open to append. */
+static void vk_prog_open(void)
+{
+    const char* path = getenv("RSX_PROGRAM_LIST");
+    if (!path || !*path) return;
+    u8* buf = (u8*)malloc(256u * 1024u);
+    long good = 8;
+    int fresh = 1;
+    FILE* f = buf ? fopen(path, "rb") : NULL;
+    if (f) {
+        char m[8];
+        if (fread(m, 1, 8, f) == 8 && !memcmp(m, kProgMagic, 8)) {
+            fresh = 0;
+            vk_prog_hdr h; const u8* vp; const u8* fp;
+            for (;;) {
+                const int r = vk_prog_read(f, &h, buf, 256u * 1024u, &vp, &fp);
+                if (r <= 0) break;
+                vk_pg_seen(h.key);
+                good = ftell(f);
+            }
+        }
+        fclose(f);
+    }
+    free(buf);
+    if (fresh) {
+        s_pg.f = fopen(path, "wb");
+        if (s_pg.f) { fwrite(kProgMagic, 1, 8, s_pg.f); fflush(s_pg.f); }
+        good = 8;
+    } else {
+        s_pg.f = fopen(path, "r+b");                       /* cut a torn tail: append after the last good record */
+        if (s_pg.f) fseek(s_pg.f, good, SEEK_SET);
+    }
+    s_pg.bytes = good;
+    VK_LOG("program list: %s, %u programs%s\n", path, s_pg.n, s_pg.f ? "" : " (cannot write)");
+}
+
+static void vk_prog_close(void)
+{
+    if (s_pg.f) fclose(s_pg.f);
+    free(s_pg.seen);
+    memset(&s_pg, 0, sizeof s_pg);
+}
+
+/* vk_eng_pipeline_create, after both stages translated: the engine's inputs, once. */
+static void vk_prog_add(const vk_eng_pipe* P)
+{
+    const rsx_prog_inputs* in = rsx_draw_engine_cur_prog;
+    if (!s_pg.f || !in || in->version != RSX_PROG_INPUTS_VERSION) return;
+    const u8* vp = rsx_draw_engine_cur_vp;
+    const u8* fp = rsx_draw_engine_cur_fp;
+    if (!in->fixed && (!vp || !fp)) return;
+    const u64 k = vk_prog_key(in, vp, fp);
+    if (vk_pg_seen(k)) return;
+    const long add = (long)(sizeof(vk_prog_hdr) + 8u + in->vp_bytes + in->fp_bytes);
+    if (s_pg.bytes + add > (long)VK_PROG_MAX_BYTES) return;
+    vk_prog_hdr h;
+    memset(&h, 0, sizeof h);
+    h.key = k;
+    h.vs_hash = P->vs_hash; h.vs_words = P->vs_words;
+    h.fs_hash = P->fs_hash; h.fs_words = P->fs_words;
+    h.in = *in;
+    vk_prog_write(s_pg.f, &h, vp, fp);
+    if (fflush(s_pg.f) != 0) {
+        VK_LOG("program list: write failed; no more programs recorded this run%c", 10);
+        fclose(s_pg.f); s_pg.f = NULL;
+        return;
+    }
+    s_pg.bytes += add;
+}
+
 static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
                                   const rsx_be_render_state* rs, const rsx_vertex_layout_plan* layout,
                                   u32 vertex_stride, rsx_be_format rt_fmt, u32 rt_count)
@@ -5271,6 +5410,7 @@ static u32 vk_eng_pipeline_create(void* user, const char* vs_hlsl, const char* p
     P->rt_fi = rt_fmt == RSX_BE_FMT_R16G16B16A16F ? 1u : 0u;
     P->wpos = strstr(ps_hlsl, "input.position") != NULL;
     P->used = 1;
+    vk_prog_add(P);
     return slot + 1u;
 }
 
@@ -5591,7 +5731,7 @@ static FILE* vk_pw_find_programs(vk_pw_spv* sp, u32 ns, const u32* wc, u32 nw, u
      * it open -- so the walk waits for that first translation. */
     for (;;) {
         RsxSpirvCacheStats cs; rsx_hlsl_to_spirv_cache_stats(&cs);
-        if (cs.memory_hits + cs.disk_hits + cs.translations || SDL_AtomicGet(&s_pw.stop)) break;
+        if (cs.memory_hits + cs.disk_hits + cs.translations || vk_prepare_mode() || SDL_AtomicGet(&s_pw.stop)) break;
         SDL_Delay(20);
     }
     const char* path = getenv("RSX_SHADER_CACHE");
@@ -5628,106 +5768,14 @@ static VkShaderModule vk_pw_module(FILE* f, const vk_pw_spv* s, u32* buf)
     return pvkCreateShaderModule(s_vk.device, &ci, NULL, &m) == VK_SUCCESS ? m : VK_NULL_HANDLE;
 }
 
-/* RSX_PIPELINE_PREWARM=keep (the default on macOS): the pre-warm runs at
- * every start that has a list, on RSX_PIPELINE_PREWARM_THREADS threads
- * (default 3), each with a pipeline cache of its own made from the loaded
- * file, and keeps what it builds: the draw that first needs a listed variant
- * takes it from s_pwk instead of building it on the render thread (mid-play
- * that was a 20 ms-1.6 s hitch per new pipeline on Apple Silicon: MoltenVK
- * compiles the Metal library even for a pipeline-cache hit). A variant a
- * worker is building is waited for; one no worker has started is built by
- * the draw as before. The workers' caches are merged into the main one
- * (vk_ap_merge) once they are all done. */
-typedef struct { u64 key; VkPipeline pipe; SDL_atomic_t st; } vk_pwk;   /* st: 0 listed, 1 building, 2 ready, 3 none, 4 taken */
-static vk_pwk* s_pwk;
-static u32 s_pwk_cap;
-static int s_pw_keep;
-static SDL_atomic_t s_pw_next, s_pw_built, s_pw_failed, s_pw_absent, s_pw_live;
-static u32 s_pw_taken;                 /* render thread: kept pipelines its draws took */
-static struct { vk_pw_spv* sp; u32 ns; unsigned long long t0; } s_pwj;
-
-static vk_pwk* vk_pwk_find(u64 key)
-{
-    if (!s_pwk) return NULL;
-    for (u32 j = (u32)(key ^ (key >> 32)) & (s_pwk_cap - 1u); s_pwk[j].key; j = (j + 1u) & (s_pwk_cap - 1u))
-        if (s_pwk[j].key == key) return &s_pwk[j];
-    return NULL;
-}
-
-/* One worker: list records by a shared index, each built once. */
-static int SDLCALL vk_prewarm_worker(void* arg)
-{
-    const u32 wi = (u32)(uintptr_t)arg;
-    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
-    const char* path = getenv("RSX_SHADER_CACHE");
-    FILE* f = (path && *path) ? fopen(path, "rb") : NULL;
-    u32* buf = (u32*)malloc(VK_SPV_WORDS * sizeof *buf);
-    VkPipelineCache pc = s_pw_keep ? s_pw_cache[wi] : s_g.pcache;
-    VkRenderPass rp[2][RSX_BE_MAX_COLOR_TARGETS + 1];
-    memset(rp, 0, sizeof rp);
-    VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
-    const vk_pw_spv* vcur = NULL;
-    const vk_pw_spv* fcur = NULL;
-    unsigned long long tlog = ps3_qpc_us();
-    const vk_vdesc* recs = s_pw.recs;
-    const u32 n = s_pw.n;
-    while (f && buf && pc && !SDL_AtomicGet(&s_pw.stop)) {
-        const u32 i = (u32)SDL_AtomicAdd(&s_pw_next, 1);
-        if (i >= n) break;
-        const vk_vdesc* d = &recs[i];
-        vk_pwk* k = s_pw_keep ? vk_pwk_find(vk_vdesc_key(d)) : NULL;
-        if (k && !SDL_AtomicCAS(&k->st, 0, 1)) continue;       /* the render thread took it */
-        const vk_pw_spv* vs = vk_pw_find(s_pwj.sp, s_pwj.ns, d->vs_hash, d->vs_words);
-        const vk_pw_spv* fs = vk_pw_find(s_pwj.sp, s_pwj.ns, d->fs_hash, d->fs_words);
-        VkPipeline p = VK_NULL_HANDLE;
-        if (!vs || vs->off < 0 || !fs || fs->off < 0) {
-            SDL_AtomicAdd(&s_pw_absent, 1);
-        } else {
-            if (vs != vcur) { if (vm) pvkDestroyShaderModule(s_vk.device, vm, NULL); vm = vk_pw_module(f, vs, buf); vcur = vs; }
-            if (fs != fcur) { if (fm) pvkDestroyShaderModule(s_vk.device, fm, NULL); fm = vk_pw_module(f, fs, buf); fcur = fs; }
-            VkRenderPass* r = &rp[d->rt_fi][d->rt_count];
-            if (!*r) *r = vk_eng_make_render_pass(d->rt_count, d->rt_fi, 0);
-            if (!vm || !fm || !*r || vk_vdesc_build(d, vm, fm, *r, &p, 0, pc) != VK_SUCCESS) { p = VK_NULL_HANDLE; SDL_AtomicAdd(&s_pw_failed, 1); }
-        }
-        if (k) {
-            k->pipe = p;
-            SDL_MemoryBarrierRelease();
-            SDL_AtomicSet(&k->st, p ? 2 : 3);
-        } else if (p) pvkDestroyPipeline(s_vk.device, p, NULL);
-        if (p && ((u32)SDL_AtomicAdd(&s_pw_built, 1) & 63u) == 63u && !s_pw_keep) SDL_AtomicSet(&s_pw_dirty, 1);
-        const unsigned long long now = ps3_qpc_us();
-        if (wi == 0 && now - tlog >= 5000000ull) {
-            tlog = now;
-            VK_LOG("pipeline pre-warm: %d of %u built (%.1f s)\n", SDL_AtomicGet(&s_pw_built), n, (now - s_pwj.t0) / 1e6);
-        }
-    }
-    if (vm) pvkDestroyShaderModule(s_vk.device, vm, NULL);
-    if (fm) pvkDestroyShaderModule(s_vk.device, fm, NULL);
-    for (u32 fi = 0; fi < 2; fi++)
-        for (u32 c = 0; c <= RSX_BE_MAX_COLOR_TARGETS; c++)
-            if (rp[fi][c]) pvkDestroyRenderPass(s_vk.device, rp[fi][c], NULL);
-    if (f) fclose(f);
-    free(buf);
-    if (SDL_AtomicAdd(&s_pw_live, -1) == 1) {                    /* the last one out */
-        const int built = SDL_AtomicGet(&s_pw_built);
-        VK_LOG("pipeline pre-warm: %s, %d of %u variants built in %.1f s (%d without their programs, %d failed)\n",
-               SDL_AtomicGet(&s_pw.stop) ? "stopped" : "done", built, n, (ps3_qpc_us() - s_pwj.t0) / 1e6,
-               SDL_AtomicGet(&s_pw_absent), SDL_AtomicGet(&s_pw_failed));
-        if (built && !s_pw_keep) SDL_AtomicSet(&s_pw_dirty, 1);
-        if (s_pw_keep) { SDL_MemoryBarrierRelease(); s_pw_merge = 1; }
-        s_pw_running = 0;
-    }
-    return 0;
-}
-
 static int SDLCALL vk_prewarm_thread(void* arg)
 {
     (void)arg;
     SDL_SetThreadPriority(SDL_THREAD_PRIORITY_LOW);
-    s_pwj.t0 = ps3_qpc_us();
+    const unsigned long long t0 = ps3_qpc_us();
     const vk_vdesc* recs = s_pw.recs;
     const u32 n = s_pw.n;
-    u32 ns = 0, nw = 0, found = 0;
+    u32 ns = 0, nw = 0, found = 0, built = 0, absent = 0, failed = 0;
     vk_pw_spv* sp = (vk_pw_spv*)malloc((size_t)n * 2u * sizeof *sp);
     u32* wc  = (u32*)malloc((size_t)n * 2u * sizeof *wc);
     u32* buf = (u32*)malloc(VK_SPV_WORDS * sizeof *buf);
@@ -5747,45 +5795,56 @@ static int SDLCALL vk_prewarm_thread(void* arg)
         f = vk_pw_find_programs(sp, ns, wc, nw, buf, &found);
         if (!f) VK_LOG("pipeline pre-warm: no shader cache file to read the programs from\n");
     }
-    free(wc); free(buf);
-    u32 nth = 1;
     if (f) {
-        fclose(f);
         VK_LOG("pipeline pre-warm: %u of the %u programs found in the shader cache (%.1f s)\n",
-               found, ns, (ps3_qpc_us() - s_pwj.t0) / 1e6);
-        s_pwj.sp = sp; s_pwj.ns = ns;
-        if (s_pw_keep) {
-            const char* e = getenv("RSX_PIPELINE_PREWARM_THREADS");
-            nth = e ? (u32)atoi(e) : 3u;
-            if (nth < 1) nth = 1;
-            if (nth > 8) nth = 8;
-            for (u32 i = 0; i < nth; i++) {
-                VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
-                                                 .initialDataSize = s_pw_blob_n, .pInitialData = s_pw_blob_n ? s_pw_blob : NULL };
-                if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_pw_cache[i]) != VK_SUCCESS) {
-                    ci.initialDataSize = 0; ci.pInitialData = NULL;
-                    if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_pw_cache[i]) != VK_SUCCESS) s_pw_cache[i] = VK_NULL_HANDLE;
-                }
+               found, ns, (ps3_qpc_us() - t0) / 1e6);
+        /* In list order (first seen first); a module carries over while
+         * consecutive records share it. */
+        VkRenderPass rp[2][RSX_BE_MAX_COLOR_TARGETS + 1];
+        memset(rp, 0, sizeof rp);
+        VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
+        const vk_pw_spv* vcur = NULL;
+        const vk_pw_spv* fcur = NULL;
+        unsigned long long tlog = ps3_qpc_us();
+        for (u32 i = 0; i < n && !SDL_AtomicGet(&s_pw.stop); i++) {
+            const vk_vdesc* d = &recs[i];
+            const vk_pw_spv* vs = vk_pw_find(sp, ns, d->vs_hash, d->vs_words);
+            const vk_pw_spv* fs = vk_pw_find(sp, ns, d->fs_hash, d->fs_words);
+            if (!vs || vs->off < 0 || !fs || fs->off < 0) { absent++; continue; }
+            if (vs != vcur) {
+                if (vm) pvkDestroyShaderModule(s_vk.device, vm, NULL);
+                vm = vk_pw_module(f, vs, buf); vcur = vs;
             }
-            VK_LOG("pipeline pre-warm: %u variants on %u threads, kept for the draws\n", n, nth);
+            if (fs != fcur) {
+                if (fm) pvkDestroyShaderModule(s_vk.device, fm, NULL);
+                fm = vk_pw_module(f, fs, buf); fcur = fs;
+            }
+            VkRenderPass* r = &rp[d->rt_fi][d->rt_count];
+            if (!*r) *r = vk_eng_make_render_pass(d->rt_count, d->rt_fi, 0);
+            VkPipeline p = VK_NULL_HANDLE;
+            if (!vm || !fm || !*r || vk_vdesc_build(d, vm, fm, *r, &p, 0, s_g.pcache) != VK_SUCCESS) { failed++; continue; }
+            pvkDestroyPipeline(s_vk.device, p, NULL);
+            if ((++built & 63u) == 0) SDL_AtomicSet(&s_pw_dirty, 1);
+            const unsigned long long now = ps3_qpc_us();
+            if (now - tlog >= 5000000ull) {
+                tlog = now;
+                VK_LOG("pipeline pre-warm: %u of %u built (%.1f s)\n", built, n, (now - t0) / 1e6);
+            }
         }
+        if (vm) pvkDestroyShaderModule(s_vk.device, vm, NULL);
+        if (fm) pvkDestroyShaderModule(s_vk.device, fm, NULL);
+        for (u32 fi = 0; fi < 2; fi++)
+            for (u32 c = 0; c <= RSX_BE_MAX_COLOR_TARGETS; c++)
+                if (rp[fi][c]) pvkDestroyRenderPass(s_vk.device, rp[fi][c], NULL);
+        fclose(f);
     }
-    free(s_pw_blob); s_pw_blob = NULL; s_pw_blob_n = 0;
-    SDL_Thread* extra[8] = { 0 };
-    SDL_AtomicSet(&s_pw_live, (int)nth);
-    if (f) {
-        for (u32 i = 1; i < nth; i++) {
-            extra[i] = SDL_CreateThread(vk_prewarm_worker, "pipeline-prewarm", (void*)(uintptr_t)i);
-            if (!extra[i]) SDL_AtomicAdd(&s_pw_live, -1);
-        }
-        vk_prewarm_worker((void*)(uintptr_t)0);
-        for (u32 i = 1; i < nth; i++) if (extra[i]) SDL_WaitThread(extra[i], NULL);
-    } else {
-        s_pw_running = 0;
-        if (s_pw_keep) for (u32 j = 0; j < s_pwk_cap; j++) if (s_pwk[j].key) SDL_AtomicCAS(&s_pwk[j].st, 0, 3);
-    }
-    free(sp); s_pwj.sp = NULL; s_pwj.ns = 0;
+    VK_LOG("pipeline pre-warm: %s, %u of %u variants built in %.1f s (%u without their programs, %u failed)\n",
+           SDL_AtomicGet(&s_pw.stop) ? "stopped" : "done", built, n, (ps3_qpc_us() - t0) / 1e6, absent, failed);
+    if (built) SDL_AtomicSet(&s_pw_dirty, 1);
+    if (built && !SDL_AtomicGet(&s_pw.stop)) vk_shaders_state("ok");
+    free(sp); free(wc); free(buf);
     free(s_pw.recs); s_pw.recs = NULL;
+    s_pw_running = 0;
     return 0;
 }
 
@@ -5855,27 +5914,12 @@ static void vk_plist_open(int rebuild)
     s_pl.f = fopen(path, "ab");
     VK_LOG("pipeline list: %s, %u variants%s\n", path, n, s_pl.f ? "" : " (cannot append)");
     if (upgraded) { VK_LOG("pipeline list: %u variants take the blend constant now%c", upgraded, 10); rebuild = 1; }
-    const char* pw = getenv("RSX_PIPELINE_PREWARM");
-#ifdef __APPLE__
-    if (!pw || !*pw) pw = "keep";
-#endif
-    if (pw && *pw) rebuild = pw[0] != '0';
-    s_pw_keep = rebuild && n && pw && !strcmp(pw, "keep");
-    if (s_pw_keep) {
-        u32 cap = 64; while (cap < 2u * n) cap *= 2u;
-        s_pwk = (vk_pwk*)calloc(cap, sizeof *s_pwk);
-        if (!s_pwk) s_pw_keep = 0;
-        else {
-            s_pwk_cap = cap;
-            for (u32 i = 0; i < n; i++) {
-                const u64 key = vk_vdesc_key(&recs[i]);
-                u32 j = (u32)(key ^ (key >> 32)) & (cap - 1u);
-                while (s_pwk[j].key && s_pwk[j].key != key) j = (j + 1u) & (cap - 1u);
-                s_pwk[j].key = key;
-            }
-        }
+    if (vk_prepare_mode()) {                                 /* rsx_vulkan_prepare_shaders builds them */
+        s_pw.recs = recs; s_pw.n = n;
+        return;
     }
-    if (!s_pw_keep) { free(s_pw_blob); s_pw_blob = NULL; s_pw_blob_n = 0; }
+    const char* pw = getenv("RSX_PIPELINE_PREWARM");
+    if (pw && *pw) rebuild = pw[0] != '0';
     if (rebuild && n) {
         s_pw.recs = recs; s_pw.n = n;
         SDL_AtomicSet(&s_pw.stop, 0);
@@ -5900,14 +5944,401 @@ static void vk_plist_close(void)
         SDL_WaitThread(s_pw.thread, NULL);
         s_pw.thread = NULL;
     }
-    for (u32 j = 0; j < s_pwk_cap; j++)
-        if (s_pwk[j].pipe && SDL_AtomicGet(&s_pwk[j].st) == 2) pvkDestroyPipeline(s_vk.device, s_pwk[j].pipe, NULL);
-    free(s_pwk); s_pwk = NULL; s_pwk_cap = 0;
-    for (u32 i = 0; i < 8; i++) if (s_pw_cache[i]) { pvkDestroyPipelineCache(s_vk.device, s_pw_cache[i], NULL); s_pw_cache[i] = VK_NULL_HANDLE; }
-    free(s_pw_blob); s_pw_blob = NULL; s_pw_blob_n = 0;
     if (s_pl.f) fclose(s_pl.f);
     free(s_pl.seen);
     memset(&s_pl, 0, sizeof s_pl);
+}
+
+
+/* ---- the shader prepare (RACACIT_PREPARE=1) --------------------------------
+ * Every variant in pipelinelist.bin built again into the pipeline cache on all
+ * cores at once, in the foreground, before play: what the background pre-warm
+ * does on one low-priority thread while the game runs. No window: the
+ * launcher reads <cache folder>/shaders.progress (vk_prep_progress_thread) for
+ * its bar. */
+static struct {
+    SDL_atomic_t next, built, failed, absent, state;  /* state: rsx_vulkan_prepare_progress */
+    const vk_pw_spv* sp;
+    u32 ns;
+    const char* spv_path;
+} s_prep;
+static u32 s_prep_total;
+
+static int rsx_vk_regen_done(void);
+static int rsx_vk_regen_total(void);
+
+void rsx_vulkan_prepare_progress(int out[5])
+{
+    out[0] = SDL_AtomicGet(&s_prep.state);   /* 0 starting, 1 reading, 2 building, 3 done, 4 failed, 5 regenerating */
+    if (out[0] == 5) {
+        out[1] = rsx_vk_regen_done(); out[2] = rsx_vk_regen_total(); out[3] = out[4] = 0;
+        return;
+    }
+    out[1] = SDL_AtomicGet(&s_prep.built) + SDL_AtomicGet(&s_prep.failed) + SDL_AtomicGet(&s_prep.absent);
+    out[2] = (int)s_prep_total;
+    out[3] = SDL_AtomicGet(&s_prep.failed);
+    out[4] = SDL_AtomicGet(&s_prep.absent);
+}
+
+static int SDLCALL vk_prep_worker(void* arg)
+{
+    (void)arg;
+    const vk_vdesc* recs = s_pw.recs;
+    const u32 n = s_pw.n;
+    u32* buf = (u32*)malloc(VK_SPV_WORDS * sizeof *buf);
+    FILE* f = fopen(s_prep.spv_path, "rb");
+    VkRenderPass rp[2][RSX_BE_MAX_COLOR_TARGETS + 1];
+    memset(rp, 0, sizeof rp);
+    VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
+    const vk_pw_spv* vcur = NULL;
+    const vk_pw_spv* fcur = NULL;
+    for (;;) {
+        const u32 i = (u32)SDL_AtomicAdd(&s_prep.next, 1);
+        if (i >= n) break;
+        const vk_vdesc* d = &recs[i];
+        const vk_pw_spv* vs = vk_pw_find((vk_pw_spv*)s_prep.sp, s_prep.ns, d->vs_hash, d->vs_words);
+        const vk_pw_spv* fs = vk_pw_find((vk_pw_spv*)s_prep.sp, s_prep.ns, d->fs_hash, d->fs_words);
+        if (!vs || vs->off < 0 || !fs || fs->off < 0) { SDL_AtomicIncRef(&s_prep.absent); continue; }
+        if (!buf || !f) { SDL_AtomicIncRef(&s_prep.failed); continue; }
+        if (vs != vcur) {
+            if (vm) pvkDestroyShaderModule(s_vk.device, vm, NULL);
+            vm = vk_pw_module(f, vs, buf); vcur = vs;
+        }
+        if (fs != fcur) {
+            if (fm) pvkDestroyShaderModule(s_vk.device, fm, NULL);
+            fm = vk_pw_module(f, fs, buf); fcur = fs;
+        }
+        VkRenderPass* r = &rp[d->rt_fi][d->rt_count];
+        if (!*r) *r = vk_eng_make_render_pass(d->rt_count, d->rt_fi, 0);
+        VkPipeline p = VK_NULL_HANDLE;
+        if (!vm || !fm || !*r || vk_vdesc_build(d, vm, fm, *r, &p, 0, s_g.pcache) != VK_SUCCESS) {
+            SDL_AtomicIncRef(&s_prep.failed); continue;
+        }
+        pvkDestroyPipeline(s_vk.device, p, NULL);
+        SDL_AtomicIncRef(&s_prep.built);
+    }
+    if (vm) pvkDestroyShaderModule(s_vk.device, vm, NULL);
+    if (fm) pvkDestroyShaderModule(s_vk.device, fm, NULL);
+    for (u32 fi = 0; fi < 2; fi++)
+        for (u32 c = 0; c <= RSX_BE_MAX_COLOR_TARGETS; c++)
+            if (rp[fi][c]) pvkDestroyRenderPass(s_vk.device, rp[fi][c], NULL);
+    if (f) fclose(f);
+    free(buf);
+    return 0;
+}
+
+/* ---- the prepare's first step: programlist.bin regenerated ------------------
+ * Every recorded program pair's text made again by the current translator
+ * (rsx_draw_engine_gen_hlsl) and translated (a SPIR-V cache hit when the text
+ * did not change). Where a stage's SPIR-V is new, the old (hash, size) maps to
+ * the new one: pipelinelist.bin's variants are remapped and both lists
+ * rewritten. Single-threaded: the decompilers keep their switches in globals. */
+typedef struct { u64 oh; u32 ow; u64 nh; u32 nw; } vk_spv_map;
+
+static int vk_spv_map_cmp(const void* a, const void* b)
+{
+    const vk_spv_map* x = (const vk_spv_map*)a;
+    const vk_spv_map* y = (const vk_spv_map*)b;
+    if (x->oh != y->oh) return x->oh < y->oh ? -1 : 1;
+    return x->ow < y->ow ? -1 : x->ow > y->ow;
+}
+
+static SDL_atomic_t s_regen_done, s_regen_total;
+static u32 s_rg_stats[4];     /* programs, stages changed, variants remapped, failed: for shaders.stamp */
+static double s_rg_secs;
+static int rsx_vk_regen_done(void) { return SDL_AtomicGet(&s_regen_done); }
+static int rsx_vk_regen_total(void) { return SDL_AtomicGet(&s_regen_total); }
+
+static int vk_regen_translate(const char* hlsl, int stage, u32* spv, u64* h, u32* w, char* log)
+{
+    u32 n = 0;
+    if (rsx_hlsl_to_spirv(hlsl, stage, spv, VK_SPV_WORDS, &n, log, 512) || !n) return -1;
+    *h = vk_spv_hash(spv, n); *w = n;
+    return 0;
+}
+
+/* Rewrite path through <path>.tmp with `write(f, arg)` filling it; 0 ok. */
+static int vk_rewrite_file(const char* path, int (*write)(FILE*, void*), void* arg)
+{
+    char tmp[1100];
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE* o = fopen(tmp, "wb");
+    if (!o) return -1;
+    int ok = write(o, arg) == 0;
+    ok = fclose(o) == 0 && ok;
+    if (ok) {
+#ifdef _WIN32
+        remove(path);
+#endif
+        ok = rename(tmp, path) == 0;
+    }
+    if (!ok) remove(tmp);
+    return ok ? 0 : -1;
+}
+
+static int vk_plist_write_all(FILE* o, void* arg)
+{
+    (void)arg;
+    const u32 hdr[2] = { (u32)sizeof(vk_vdesc), 1u };
+    if (fwrite(kPlistMagic, 1, 8, o) != 8 || fwrite(hdr, 4, 2, o) != 2) return -1;
+    return (s_pw.n == 0 || fwrite(s_pw.recs, sizeof *s_pw.recs, s_pw.n, o) == s_pw.n) ? 0 : -1;
+}
+
+typedef struct { const char* src; const vk_spv_map* m; u32 nm; } vk_prog_rw;
+
+static const vk_spv_map* vk_spv_map_find(const vk_spv_map* m, u32 n, u64 h, u32 w)
+{
+    const vk_spv_map k = { h, w, 0, 0 };
+    return (const vk_spv_map*)bsearch(&k, m, n, sizeof *m, vk_spv_map_cmp);
+}
+
+static int vk_prog_write_all(FILE* o, void* arg)
+{
+    const vk_prog_rw* rw = (const vk_prog_rw*)arg;
+    FILE* f = fopen(rw->src, "rb");
+    u8* buf = (u8*)malloc(256u * 1024u);
+    char m[8];
+    int ok = f && buf && fread(m, 1, 8, f) == 8 && !memcmp(m, kProgMagic, 8) && fwrite(kProgMagic, 1, 8, o) == 8;
+    if (ok) {
+        vk_prog_hdr h; const u8* vp; const u8* fp;
+        while (vk_prog_read(f, &h, buf, 256u * 1024u, &vp, &fp) > 0) {
+            const vk_spv_map* a = vk_spv_map_find(rw->m, rw->nm, h.vs_hash, h.vs_words);
+            const vk_spv_map* b = vk_spv_map_find(rw->m, rw->nm, h.fs_hash, h.fs_words);
+            if (a) { h.vs_hash = a->nh; h.vs_words = a->nw; }
+            if (b) { h.fs_hash = b->nh; h.fs_words = b->nw; }
+            vk_prog_write(o, &h, vp, fp);
+        }
+    }
+    if (f) fclose(f);
+    free(buf);
+    return ok ? 0 : -1;
+}
+
+/* Returns how many pipeline variants were remapped (0: the text did not change). */
+static u32 vk_prep_regen(void)
+{
+    const char* path = getenv("RSX_PROGRAM_LIST");
+    if (!path || !*path) return 0;
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    const unsigned long long t0 = ps3_qpc_us();
+    u8* buf = (u8*)malloc(256u * 1024u);
+    char* vs = (char*)malloc(256u * 1024u);
+    char* ps = (char*)malloc(256u * 1024u);
+    u32* spv = (u32*)malloc(VK_SPV_WORDS * sizeof *spv);
+    char log[512];
+    vk_spv_map* map = NULL;
+    u32 nmap = 0, capmap = 0, total = 0, done = 0, failed = 0, changed = 0, skipped = 0;
+    char m[8];
+    if (!buf || !vs || !ps || !spv || fread(m, 1, 8, f) != 8 || memcmp(m, kProgMagic, 8) != 0) goto out;
+    {   /* count first, for the bar */
+        vk_prog_hdr h; const u8* vp; const u8* fp;
+        const long start = ftell(f);
+        while (vk_prog_read(f, &h, buf, 256u * 1024u, &vp, &fp) > 0) total++;
+        fseek(f, start, SEEK_SET);
+        SDL_AtomicSet(&s_regen_total, (int)total);
+        SDL_AtomicSet(&s_prep.state, 5);
+        while (vk_prog_read(f, &h, buf, 256u * 1024u, &vp, &fp) > 0) {
+            SDL_AtomicSet(&s_regen_done, (int)++done);
+            if (h.in.version != RSX_PROG_INPUTS_VERSION) { skipped++; continue; }
+            int vi = 0, fi = 0; u32 nconst = 0;
+            rsx_draw_engine_gen_hlsl(&h.in, vp, fp, vs, 256u * 1024u, ps, 256u * 1024u, &vi, &fi, &nconst, NULL);
+            u64 vh, fh; u32 vw, fw;
+            if (vi <= 0 || fi <= 0 ||
+                vk_regen_translate(vs, RSX_SHADER_STAGE_VERTEX, spv, &vh, &vw, log) ||
+                vk_regen_translate(ps, RSX_SHADER_STAGE_FRAGMENT, spv, &fh, &fw, log)) { failed++; continue; }
+            const u64 oh[2] = { h.vs_hash, h.fs_hash }, nh[2] = { vh, fh };
+            const u32 ow[2] = { h.vs_words, h.fs_words }, nw[2] = { vw, fw };
+            for (int s = 0; s < 2; s++) {
+                if (oh[s] == nh[s] && ow[s] == nw[s]) continue;
+                if (nmap == capmap) {
+                    capmap = capmap ? capmap * 2u : 256u;
+                    vk_spv_map* t = (vk_spv_map*)realloc(map, capmap * sizeof *map);
+                    if (!t) goto out;
+                    map = t;
+                }
+                map[nmap++] = (vk_spv_map){ oh[s], ow[s], nh[s], nw[s] };
+                changed++;
+            }
+        }
+    }
+out:
+    fclose(f);
+    free(buf); free(vs); free(ps); free(spv);
+    u32 remapped = 0;
+    if (nmap) {
+        qsort(map, nmap, sizeof *map, vk_spv_map_cmp);
+        /* Remap the variants; two that now name the same programs and state are one. */
+        free(s_pl.seen); s_pl.seen = NULL; s_pl.cap = s_pl.n = 0;
+        u32 k = 0;
+        for (u32 i = 0; i < s_pw.n; i++) {
+            vk_vdesc d = s_pw.recs[i];
+            const vk_spv_map* a = vk_spv_map_find(map, nmap, d.vs_hash, d.vs_words);
+            const vk_spv_map* b = vk_spv_map_find(map, nmap, d.fs_hash, d.fs_words);
+            if (a) { d.vs_hash = a->nh; d.vs_words = a->nw; }
+            if (b) { d.fs_hash = b->nh; d.fs_words = b->nw; }
+            if (a || b) { d.check = vk_fnv1a32((const u8*)&d, (u32)offsetof(vk_vdesc, check)); remapped++; }
+            if (!vk_plist_seen(vk_vdesc_key(&d))) s_pw.recs[k++] = d;
+        }
+        s_pw.n = k;
+        const char* lp = getenv("RSX_PIPELINE_LIST");
+        if (s_pl.f) { fclose(s_pl.f); s_pl.f = NULL; }
+        if (lp && *lp && vk_rewrite_file(lp, vk_plist_write_all, NULL) != 0)
+            VK_LOG("shader prepare: cannot rewrite %s%c", lp, 10);
+        vk_prog_rw rw = { path, map, nmap };
+        if (s_pg.f) { fclose(s_pg.f); s_pg.f = NULL; }
+        if (vk_rewrite_file(path, vk_prog_write_all, &rw) != 0)
+            VK_LOG("shader prepare: cannot rewrite %s%c", path, 10);
+    }
+    VK_LOG("shader prepare: %u programs regenerated in %.1f s: %u shader stages changed, %u variants remapped, "
+           "%u failed, %u from an older recorder\n", done, (ps3_qpc_us() - t0) / 1e6, changed, remapped, failed, skipped);
+    s_rg_stats[0] = done; s_rg_stats[1] = changed; s_rg_stats[2] = remapped; s_rg_stats[3] = failed;
+    s_rg_secs = (ps3_qpc_us() - t0) / 1e6;
+    free(map);
+    return remapped;
+}
+
+/* <cache folder>/shaders.progress, rewritten every 250 ms while the prepare
+ * runs: "state done total failed absent" (rsx_vulkan_prepare_progress), one
+ * line. The launcher polls it for its bar; state 3 or 4 is the last write. */
+static SDL_atomic_t s_prep_pstop;
+static void vk_prep_progress_write(void)
+{
+    char path[1100];
+    if (!vk_cache_sibling(path, sizeof path, "shaders.progress")) return;
+    int p[5];
+    rsx_vulkan_prepare_progress(p);
+    FILE* f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "%d %d %d %d %d\n", p[0], p[1], p[2], p[3], p[4]);
+    fclose(f);
+}
+static int SDLCALL vk_prep_progress_thread(void* arg)
+{
+    (void)arg;
+    while (!SDL_AtomicGet(&s_prep_pstop)) { vk_prep_progress_write(); SDL_Delay(250); }
+    return 0;
+}
+
+/* After rsx_vulkan_backend_init with RACACIT_PREPARE=1 (main.cpp). Writes
+ * <cache folder>/shaders.stamp. Returns 0 when no variant failed. */
+static int vk_prepare_shaders_run(void);
+int rsx_vulkan_prepare_shaders(void)
+{
+    SDL_AtomicSet(&s_prep_pstop, 0);
+    SDL_Thread* pth = SDL_CreateThread(vk_prep_progress_thread, "shader-prepare-progress", NULL);
+    const int r = vk_prepare_shaders_run();
+    SDL_AtomicSet(&s_prep_pstop, 1);
+    if (pth) SDL_WaitThread(pth, NULL);
+    vk_prep_progress_write();                                /* the final state */
+    return r;
+}
+
+static int vk_prepare_shaders_run(void)
+{
+    const unsigned long long t0 = ps3_qpc_us();
+    SDL_AtomicSet(&s_prep.state, 1);
+    s_prep.spv_path = getenv("RSX_SHADER_CACHE");
+    if (s_g.on && s_g.pcache && s_prep.spv_path && *s_prep.spv_path) {
+        rsx_hlsl_to_spirv_cache_open();
+        vk_prep_regen();                                     /* new text for recorded programs, lists remapped */
+        SDL_AtomicSet(&s_prep.state, 1);
+    }
+    const u32 n = s_pw.n;
+    s_prep_total = n;
+    if (!s_g.on || !s_g.pcache || !s_prep.spv_path || !*s_prep.spv_path) {
+        VK_LOG("shader prepare: no pipeline or shader cache to prepare%c", 10);
+        SDL_AtomicSet(&s_prep.state, 4);
+        return -1;
+    }
+    if (!n) {
+        VK_LOG("shader prepare: nothing listed yet (play a while first)%c", 10);
+        SDL_AtomicSet(&s_prep.state, 3);
+        return 0;
+    }
+    rsx_hlsl_to_spirv_cache_open();                          /* a torn file is rewritten first */
+    vk_pw_spv* sp = (vk_pw_spv*)malloc((size_t)n * 2u * sizeof *sp);
+    u32* wc  = (u32*)malloc((size_t)n * 2u * sizeof *wc);
+    u32* buf = (u32*)malloc(VK_SPV_WORDS * sizeof *buf);
+    u32 ns = 0, nw = 0, found = 0;
+    FILE* f = NULL;
+    if (sp && wc && buf) {
+        const vk_vdesc* recs = s_pw.recs;
+        for (u32 i = 0; i < n; i++) {
+            sp[ns++] = (vk_pw_spv){ recs[i].vs_hash, recs[i].vs_words, -1 };
+            sp[ns++] = (vk_pw_spv){ recs[i].fs_hash, recs[i].fs_words, -1 };
+        }
+        qsort(sp, ns, sizeof *sp, vk_pw_spv_cmp);
+        u32 k = 0;
+        for (u32 i = 0; i < ns; i++) if (!k || vk_pw_spv_cmp(&sp[i], &sp[k - 1])) sp[k++] = sp[i];
+        ns = k;
+        for (u32 i = 0; i < ns; i++) wc[i] = sp[i].words;
+        qsort(wc, ns, sizeof *wc, vk_pw_u32_cmp);
+        for (u32 i = 0; i < ns; i++) if (!nw || wc[i] != wc[nw - 1]) wc[nw++] = wc[i];
+        f = vk_pw_find_programs(sp, ns, wc, nw, buf, &found);
+    }
+    free(buf); free(wc);
+    if (!f) {
+        VK_LOG("shader prepare: cannot read the shader cache%c", 10);
+        free(sp);
+        SDL_AtomicSet(&s_prep.state, 4);
+        return -1;
+    }
+    fclose(f);
+    s_prep.sp = sp; s_prep.ns = ns;
+    VK_LOG("shader prepare: %u variants, %u of %u programs in the shader cache (%.1f s)\n",
+           n, found, ns, (ps3_qpc_us() - t0) / 1e6);
+    SDL_AtomicSet(&s_prep.state, 2);
+    long nc = SDL_GetCPUCount();
+    const char* te = getenv("RACACIT_PREPARE_THREADS");
+    if (te && atoi(te) > 0) nc = atoi(te);
+    if (nc < 1) nc = 1;
+    if (nc > 16) nc = 16;
+    SDL_Thread* th[16];
+    int nt = 0;
+    for (long i = 0; i < nc; i++) {
+        th[nt] = SDL_CreateThread(vk_prep_worker, "shader-prepare", NULL);
+        if (th[nt]) nt++;
+    }
+    if (!nt) vk_prep_worker(NULL);
+    unsigned long long tlog = ps3_qpc_us();
+    while (nt && (u32)SDL_AtomicGet(&s_prep.next) < n) {
+        SDL_Delay(100);
+        const unsigned long long now = ps3_qpc_us();
+        if (now - tlog >= 5000000ull) {
+            tlog = now;
+            VK_LOG("shader prepare: %d of %u built (%.1f s)\n", SDL_AtomicGet(&s_prep.built), n, (now - t0) / 1e6);
+        }
+    }
+    for (int i = 0; i < nt; i++) SDL_WaitThread(th[i], NULL);
+    const int built = SDL_AtomicGet(&s_prep.built), failed = SDL_AtomicGet(&s_prep.failed),
+              absent = SDL_AtomicGet(&s_prep.absent);
+    const double secs = (ps3_qpc_us() - t0) / 1e6;
+    VK_LOG("shader prepare: %d of %u variants built in %.1f s on %d threads (%d without their programs, %d failed)\n",
+           built, n, secs, nt ? nt : 1, absent, failed);
+    s_g.pcache_dirty++;
+    vk_pcache_save(1);
+    free(sp); s_prep.sp = NULL;
+    free(s_pw.recs); s_pw.recs = NULL; s_pw.n = 0;
+    /* The stamp: which driver and which build these pipelines are for. */
+    char path[1100];
+    if (vk_cache_sibling(path, sizeof path, "shaders.stamp")) {
+        FILE* o = fopen(path, "w");
+        if (o) {
+            VkPhysicalDeviceProperties p;
+            pvkGetPhysicalDeviceProperties(s_vk.phys, &p);
+            const char* tag = getenv("RACACIT_PREPARE_TAG");
+            fprintf(o, "build=%s\nprograms=%u\nstages_changed=%u\nremapped=%u\nregen_failed=%u\nregen_seconds=%.1f\ndriver=",
+                    tag ? tag : "", s_rg_stats[0], s_rg_stats[1], s_rg_stats[2], s_rg_stats[3], s_rg_secs);
+            for (int i = 0; i < VK_UUID_SIZE; i++) fprintf(o, "%02x", p.pipelineCacheUUID[i]);
+            fprintf(o, "\ndriver_version=%u\nvariants=%u\nbuilt=%d\nabsent=%d\nfailed=%d\nseconds=%.1f\nthreads=%d\ntime=%lld\n",
+                    p.driverVersion, n, built, absent, failed, secs, nt ? nt : 1, (long long)time(NULL));
+            fclose(o);
+        }
+    }
+    vk_shaders_state("ok");
+    SDL_AtomicSet(&s_prep.state, 3);
+    return failed ? -1 : 0;
 }
 
 static const VkPrimitiveTopology k_vk_topo[VK_ENG_TOPOLOGIES] = {
@@ -5953,25 +6384,14 @@ static int SDLCALL vk_ap_thread(void* arg)
     return 0;
 }
 
-/* RACACIT_ASYNC_PIPELINES=wait: new pipelines compile on the background
- * builder and the draw that needs one waits for it -- no draw is skipped, so
- * no pass is left incomplete -- while the window thread keeps pumping events
- * (vk_keep_responsive). =1 (the default): skip the draw until it is ready;
- * =0: compile on the render thread. */
-static int vk_ap_mode(void)
-{
-    static int m = -1;
-    if (m < 0) { const char* e = getenv("RACACIT_ASYNC_PIPELINES");
-                 m = (e && *e == '0') ? 0 : (e && !strcmp(e, "wait")) ? 2 : 1; }
-    return m;
-}
-
 /* Queue a background build (render thread). 0 when it cannot. */
 static int vk_ap_queue(u32 pipe_index, u32 t, VkRenderPass rp)
 {
     if (s_ap.off) return 0;
     if (!s_ap.th) {
-        if (!vk_ap_mode()) { s_ap.off = 1; return 0; }
+        static int env = -1;
+        if (env < 0) { const char* e = getenv("RACACIT_ASYNC_PIPELINES"); env = !(e && *e == '0'); }
+        if (!env) { s_ap.off = 1; return 0; }
         s_ap.mu = SDL_CreateMutex(); s_ap.cv = SDL_CreateCond();
         VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
         if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_ap.cache) != VK_SUCCESS) s_ap.cache = VK_NULL_HANDLE;
@@ -5981,9 +6401,11 @@ static int vk_ap_queue(u32 pipe_index, u32 t, VkRenderPass rp)
     SDL_LockMutex(s_ap.mu);
     const int ok = s_ap.tail - s_ap.head < VK_AP_QUEUE;
     if (ok) {
+              /* Published before the builder can see the entry: set after the
+               * signal, a fast build's 2 was overwritten with 1 and the variant
+               * stayed "still compiling" for good (public PR #39). */
               vk_eng_pipe* P = &s_epipe[pipe_index];
-              P->skipped[t] = 1;
-              P->build_ms[t] = 0;
+              P->skipped[t] = 1; P->build_ms[t] = 0;
               SDL_AtomicSet(&P->pend[t], 1);
               SDL_AtomicAdd(&s_ap.active, 1);
               s_ap.q[s_ap.tail % VK_AP_QUEUE].pipe = pipe_index; s_ap.q[s_ap.tail % VK_AP_QUEUE].topo = t;
@@ -6004,8 +6426,6 @@ static void vk_ap_stop(void)
 static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
 {
     if (P->variant[topo_idx]) return P->variant[topo_idx];
-    if (vk_ap_mode() == 2)
-        while (SDL_AtomicGet(&P->pend[topo_idx]) == 1) { vk_keep_responsive(); SDL_Delay(1); }   /* never skipped */
     const int pend = SDL_AtomicGet(&P->pend[topo_idx]);
     if (pend == 1) { P->skipped[topo_idx]++; return VK_NULL_HANDLE; }   /* still compiling */
     if (pend == 2) {                                                    /* the builder is done */
@@ -6028,26 +6448,13 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
     vk_vdesc d;
     vk_vdesc_from(&d, P, k_vk_topo[topo_idx]);
     const unsigned long long _t0 = ps3_qpc_us();
-    /* Listed: the pre-warm's (keep mode), waited for while a worker builds it. */
-    vk_pwk* kw = s_pw_keep ? vk_pwk_find(vk_vdesc_key(&d)) : NULL;
-    if (kw && !SDL_AtomicCAS(&kw->st, 0, 4)) {
-        int st;
-        while ((st = SDL_AtomicGet(&kw->st)) == 1) { vk_keep_responsive(); SDL_Delay(1); }
-        if (st == 2 && SDL_AtomicCAS(&kw->st, 2, 4)) {
-            SDL_MemoryBarrierAcquire();
-            P->variant[topo_idx] = kw->pipe; kw->pipe = VK_NULL_HANDLE;
-            s_pw_taken++;
-            return P->variant[topo_idx];
-        }
-    }
-    vk_keep_responsive();
     /* While the builder compiles, the render thread makes no pipeline at all:
      * the driver runs one creation at a time, and even the quick cache check
      * below waited out a whole background compile (second test: a 166 ms
      * stall behind a 164 ms compile). The new one joins the queue; a cached
      * one is made there within a frame or two. */
     if (s_vk_pcc && s_ap.th && SDL_AtomicGet(&s_ap.active) > 0 && vk_ap_queue((u32)(P - s_epipe), topo_idx, rp)) {
-        return vk_ap_mode() == 2 ? vk_eng_variant(P, topo_idx) : VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
     }
     if (s_vk_pcc && !s_ap.off) {
         /* In the pipeline cache: made now. Not: compiled in the background. */
@@ -6060,14 +6467,11 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
         }
         P->variant[topo_idx] = VK_NULL_HANDLE;
         if (rc == VK_PIPELINE_COMPILE_REQUIRED_EXT && vk_ap_queue((u32)(P - s_epipe), topo_idx, rp)) {
-            return vk_ap_mode() == 2 ? vk_eng_variant(P, topo_idx) : VK_NULL_HANDLE;
+            return VK_NULL_HANDLE;
         }
     }
     const VkResult r = vk_vdesc_build(&d, P->vs, P->fs, rp, &P->variant[topo_idx], 0, s_g.pcache);
     s_vkt_var++; s_vkt_var_us += ps3_qpc_us() - _t0;
-    { static int on = -1; if (on < 0) { const char* e = getenv("RACACIT_LOAD_STATS"); on = e && *e == '1'; }
-      const unsigned long long us = ps3_qpc_us() - _t0;
-      if (on && us >= 20000) VK_LOG("[pipe-slow] render-thread pipeline build %.1f ms\n", us / 1e3); }
     s_g.pcache_dirty++;
     if (r != VK_SUCCESS) {
         VK_LOG("engine: vkCreateGraphicsPipelines failed\n");
@@ -6201,7 +6605,7 @@ static VkImageView vk_eng_scratch_depth(u32 w, u32 h)
     vk_destroy_image(&s_e2.scratch_depth);
     if (vk_create_image(&s_e2.scratch_depth, s_vk.eng_depth_format, w, h,
                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                        s_vk.eng_depth_aspect) || vk_begin_xfer())
+                        s_vk.eng_depth_aspect) || vk_begin())
         return VK_NULL_HANDLE;
     vk_barrier_image(s_e2.scratch_depth.img, s_vk.eng_depth_aspect, VK_IMAGE_LAYOUT_UNDEFINED);
     VkClearDepthStencilValue far_plane = { 1.0f, 0 };
@@ -6973,13 +7377,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     s_vk.dump_path = getenv("PS3RECOMP_VK_DUMP");
 
 #ifdef __APPLE__
-    /* Metal compiles a pipeline's shaders on as many threads as it has: the
-     * pre-warm builds on several (vk_prewarm_thread). */
-    setenv("MVK_CONFIG_SHOULD_MAXIMIZE_CONCURRENT_COMPILATION", "1", 0);
     if (vk_load_library()) return -1;
 #endif
     vk_window_open(title);           /* no-op unless PS3RECOMP_VK_WINDOW is set */
-    vk_keep_responsive();
     /* The window opened at the guest's size; the image the frame is composed
      * in follows the internal resolution, so a higher one reaches the screen
      * (the swapchain blit fits it to the window). */
@@ -7055,7 +7455,6 @@ static int vk_init_all(u32 width, u32 height, const char* title)
             vk_window_drop(why);
         }
     }
-    vk_keep_responsive();
     if (vk_pick_device()) {
         if (!s_vk.windowed) return -1;
         vk_window_drop("no device can present to the window");
@@ -7116,7 +7515,6 @@ static int vk_init_all(u32 width, u32 height, const char* title)
      * fetch takes the process with it (llvmpipe does). robustBufferAccess is
      * mandatory-to-support in Vulkan 1.0, so this only turns it on. */
     want.robustBufferAccess = have.robustBufferAccess;
-    { const char* e = getenv("RSX_VK_ROBUST"); if (e && *e == '0') want.robustBufferAccess = VK_FALSE; }   /* LOCAL test */
     want.depthClamp = have.depthClamp;
     /* User clip planes (rsx_vp_apply_user_clip, upstream b19ac284) write
      * SV_ClipDistance: the SPIR-V then declares the ClipDistance capability. */
@@ -7188,7 +7586,6 @@ static int vk_init_all(u32 width, u32 height, const char* title)
                               VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return -1;
     if (vk_create_render_pass()) return -1;
     if (vk_create_pipeline_objects()) return -1;
-    vk_keep_responsive();
     if (vk_guest_init()) {
         VK_LOG("guest programs: setup failed, fixed-function path only\n");
         vk_guest_shutdown();
@@ -7209,7 +7606,6 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     pvkCmdClearColorImage(s_vk.cmd, s_vk.color.img, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &cr);
     pvkCmdClearDepthStencilImage(s_vk.cmd, s_vk.depth.img, VK_IMAGE_LAYOUT_GENERAL, &far_plane, 1, &dr);
     if (vk_submit_and_wait()) return -1;
-    vk_keep_responsive();
 
     if (s_vk.windowed) {
         VkSemaphoreCreateInfo semi = { .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
@@ -7220,43 +7616,9 @@ static int vk_init_all(u32 width, u32 height, const char* title)
     return 0;
 }
 
-#ifdef __APPLE__
-#include <pthread.h>
-static unsigned long long s_vk_pump_us;   /* the window thread's last event pump */
-static pthread_t s_vk_event_thread;
-static int s_vk_event_thread_set;
-/* RACACIT_LOAD_STATS=1: every 100 ms or more the window thread went without
- * pumping events, with the longest so far. */
-static void vk_pump_mark(unsigned long long now)
-{
-    static int on = -1; static double worst;
-    if (on < 0) { const char* e = getenv("RACACIT_LOAD_STATS"); on = e && *e == '1'; }
-    if (on && s_vk_pump_us && now - s_vk_pump_us >= 100000) {
-        const double ms = (now - s_vk_pump_us) / 1e3;
-        if (ms > worst) worst = ms;
-        VK_LOG("[pump-gap] %.0f ms without pumping events (longest %.0f)\n", ms, worst);
-    }
-    s_vk_pump_us = now;
-}
-static void vk_keep_responsive(void)
-{
-    if (!s_vk_event_thread_set || !pthread_equal(pthread_self(), s_vk_event_thread)) return;
-    const unsigned long long now = ps3_qpc_us();
-    if (now - s_vk_pump_us < 50000) return;
-    vk_pump_mark(now);
-    if (s_vk.window) SDL_PumpEvents();   /* queued for the frame loop's SDL_PollEvent */
-}
-#else
-static void vk_keep_responsive(void) { }
-#endif
-
 int rsx_vulkan_backend_init(u32 width, u32 height, const char* title)
 {
     memset(&s_vk, 0, sizeof s_vk);
-#ifdef __APPLE__
-    s_vk_event_thread = pthread_self(); s_vk_event_thread_set = 1;
-    s_vk_pump_us = ps3_qpc_us();
-#endif
     if (vk_init_all(width, height, title)) {
         rsx_vulkan_backend_shutdown();
         return -1;
@@ -7334,9 +7696,6 @@ void rsx_vulkan_backend_shutdown(void)
 
 int rsx_vulkan_backend_pump_messages(void)
 {
-#ifdef __APPLE__
-    if (s_vk_event_thread_set && pthread_equal(pthread_self(), s_vk_event_thread)) vk_pump_mark(ps3_qpc_us());
-#endif
     if (!s_vk.windowed) return 0;
     int quit = 0;
     SDL_Event e;

@@ -1232,22 +1232,26 @@ static void pad_poll_sdl2(void)
  * separated by commas, "none" for nothing. Buttons: CROSS CIRCLE SQUARE
  * TRIANGLE L1 R1 L2 R2 L3 R3 START SELECT UP DOWN LEFT RIGHT, the stick
  * directions LS_UP LS_DOWN LS_LEFT LS_RIGHT (and RS_* for the camera keys),
- * and WALK (held: the left stick at half). The mouse turns the camera once it
+ * and WALK (held: the left stick at half), and the quick select keys QS_1 -
+ * QS_8, QS_PREV QS_NEXT, QS_PREV_RING QS_NEXT_RING (only while the ring is
+ * open; see pad_poll_kbm). The mouse turns the camera once it
  * is captured (click in the window; rsx_host_ui.c). On/off, mouse speed and
  * invert are in Settings > Controls (RACACIT_KBM, RACACIT_MOUSE_SENS,
  * RACACIT_MOUSE_INVERT_Y, live); PAD_NO_KEYBOARD=1 turns it off for the run.
  * Keys pressed pause scripted test input like a controller does. */
 enum { KB_CROSS, KB_CIRCLE, KB_SQUARE, KB_TRIANGLE, KB_L1, KB_R1, KB_L2, KB_R2, KB_L3, KB_R3, KB_START, KB_SELECT,
        KB_UP, KB_DOWN, KB_LEFT, KB_RIGHT, KB_LS_UP, KB_LS_DOWN, KB_LS_LEFT, KB_LS_RIGHT,
-       KB_RS_UP, KB_RS_DOWN, KB_RS_LEFT, KB_RS_RIGHT, KB_WALK, KB_N };
+       KB_RS_UP, KB_RS_DOWN, KB_RS_LEFT, KB_RS_RIGHT, KB_WALK,
+       KB_QS_1, KB_QS_2, KB_QS_3, KB_QS_4, KB_QS_5, KB_QS_6, KB_QS_7, KB_QS_8,
+       KB_QS_PREV, KB_QS_NEXT, KB_QS_PREV_RING, KB_QS_NEXT_RING, KB_N };
 static const struct { const char* name; u16 btn; const char* def; } k_kb[KB_N] = {
     { "CROSS",    CELL_PAD_CTRL_CROSS,    "Space,Return" },
     { "CIRCLE",   CELL_PAD_CTRL_CIRCLE,   "E,Backspace" },
     { "SQUARE",   CELL_PAD_CTRL_SQUARE,   "F" },
     { "TRIANGLE", CELL_PAD_CTRL_TRIANGLE, "Q" },
-    { "L1",       CELL_PAD_CTRL_L1,       "Left Ctrl" },          /* Left Ctrl */
+    { "L1",       CELL_PAD_CTRL_L1,       "Left Ctrl" },
     { "R1",       CELL_PAD_CTRL_R1,       "Mouse1" },          /* fire (left mouse button) */
-    { "L2",       CELL_PAD_CTRL_L2,       "Mouse3" },
+    { "L2",       CELL_PAD_CTRL_L2,       "Mouse3" },          /* strafe / aim (right mouse button) */
     { "R2",       CELL_PAD_CTRL_R2,       "Left Shift" },
     { "L3",       CELL_PAD_CTRL_L3,       "V" },
     { "R3",       CELL_PAD_CTRL_R3,       "Mouse2,B" },        /* middle mouse button */
@@ -1266,10 +1270,26 @@ static const struct { const char* name; u16 btn; const char* def; } k_kb[KB_N] =
     { "RS_LEFT",  0, "J" },
     { "RS_RIGHT", 0, "L" },
     { "WALK",     0, "Left Alt" },
+    { "QS_1",     0, "1" },                /* quick select, while the ring is open: slot 1 (top) */
+    { "QS_2",     0, "2" },                /* ... then clockwise */
+    { "QS_3",     0, "3" },
+    { "QS_4",     0, "4" },
+    { "QS_5",     0, "5" },
+    { "QS_6",     0, "6" },
+    { "QS_7",     0, "7" },
+    { "QS_8",     0, "8" },
+    { "QS_PREV",  0, "Z" },                /* the slot before (anticlockwise) */
+    { "QS_NEXT",  0, "X" },                /* the slot after (clockwise) */
+    { "QS_PREV_RING", 0, "R" },            /* the game's L1 */
+    { "QS_NEXT_RING", 0, "T" },            /* the game's R1 */
 };
 /* An input: a scancode (< 512), or 512 + mouse button 1-5, or 520/521 the wheel. */
 #define KB_MAX_KEYS 4
 static int s_kb_keys[KB_N][KB_MAX_KEYS];
+static unsigned char s_kb_is_qs[522];   /* the input is on a quick select key: it presses nothing else while the ring is open */
+/* The in-game text prompts show keycaps (game/desktop_prompts.h) while this is 1:
+ * set by keyboard/mouse input, cleared by controller input, and at start 1 only
+ * with no controller attached. */
 static SDL_atomic_t s_racit_keyboard_prompts = {1};
 int racit_keyboard_prompts_active(void) { return SDL_AtomicGet(&s_racit_keyboard_prompts); }
 static int s_kbm_on = -1;             /* allowed this run (PAD_NO_KEYBOARD) */
@@ -1302,7 +1322,7 @@ static void kb_init(int ignore_real)
             while (*tok == ' ') tok++;
             char* end = tok + strlen(tok); while (end > tok && end[-1] == ' ') *--end = 0;
             const int key = kb_parse_one(tok);
-            if (key >= 0) s_kb_keys[k][n++] = key;
+            if (key >= 0) { s_kb_keys[k][n++] = key; if (k >= KB_QS_1) s_kb_is_qs[key] = 1; }
             else if (*tok && SDL_strcasecmp(tok, "none")) fprintf(stderr, "[cellPad] %s: unknown key \"%s\"%c", env, tok, 10);
             tok = c ? c + 1 : NULL;
         }
@@ -1324,21 +1344,71 @@ static void pad_poll_kbm(int ignore_real)
      * not play, and nothing stays held across an Alt+Tab. */
     const Uint8* ks = !ignore_real && SDL_GetKeyboardFocus() ? SDL_GetKeyboardState(NULL) : NULL;
     const int test = rsx_host_ui_test_key(-1);
-    int held[KB_N] = { 0 };
+    int held[KB_N] = { 0 }, held_open[KB_N] = { 0 };
     if (ks || test)
         for (int k = 0; k < KB_N; k++)
             for (int i = 0; i < KB_MAX_KEYS && s_kb_keys[k][i] >= 0; i++) {
                 const int key = s_kb_keys[k][i];
-                if (test && rsx_host_ui_test_key(key)) held[k] = 1;
-                else if (key < 512) { if (ks && ks[key]) held[k] = 1; }
+                int by_key = 0;
+                if (test && rsx_host_ui_test_key(key)) { held[k] = 1; by_key = 1; }
+                else if (key < 512) { if (ks && ks[key]) { held[k] = 1; by_key = 1; } }
                 else if (key < 520) { if (mb & (1u << (key - 513))) held[k] = 1; }
                 else if ((key == 520 && wheel > 0) || (key == 521 && wheel < 0)) held[k] = 1;
+                if (by_key && !s_kb_is_qs[key]) held_open[k] = 1;
             }
     PadHostState* hs = &s_host_state[0];
     hs->connected = 1;   /* with no controller the keyboard is the pad (pad_poll_sdl2 left it neutral) */
+    /* Quick select by mouse or trackpad. The ring is open while TRIANGLE is
+     * held (150 ms, as the controller poll tells it); the game picks a slot
+     * with the LEFT stick ("Use L to select"), eight around the ring with the
+     * first at the top, and pages rings with its L1 / R1. While it is open the
+     * mouse is a pointer from the ring's centre: moving toward a slot points
+     * the left stick there (the movement keys still win), left click or wheel
+     * up is the previous ring, right click or wheel down the next, and the
+     * camera stays still. Releasing the key equips, as on a controller.
+     * Keys while it is open: QS_1 - QS_8 (1 - 8) point at that slot, QS_PREV /
+     * QS_NEXT (Z / X) step to the slot before / after the one pointed at, and
+     * QS_PREV_RING / QS_NEXT_RING (R / T) are L1 / R1. A key on these presses
+     * nothing else while the ring is open (1 - 4 are the d-pad otherwise). */
+    static Uint64 qs_t0; static float qx, qy; static int qs_was[KB_N];
+    int qs_open = 0;
+    if (!held[KB_TRIANGLE]) { qs_t0 = 0; qx = qy = 0.0f; memset(qs_was, 0, sizeof qs_was); }
+    else {
+        const Uint64 nw = SDL_GetTicks64();
+        if (!qs_t0) qs_t0 = nw;
+        qs_open = nw - qs_t0 >= 150;
+    }
     u16 btns = 0;
-    for (int k = 0; k < KB_N; k++) if (held[k] && k_kb[k].btn) btns |= k_kb[k].btn;
-    if (btns || dx || dy || wheel || mb || held[KB_LS_UP] || held[KB_LS_DOWN] || held[KB_LS_LEFT] || held[KB_LS_RIGHT]) SDL_AtomicSet(&s_racit_keyboard_prompts,1);
+    for (int k = 0; k < KB_N; k++)
+        if (k_kb[k].btn && (qs_open && k != KB_TRIANGLE ? held_open[k] : held[k])) btns |= k_kb[k].btn;
+    if (qs_open) {
+        /* A slot key moves the pointer onto that slot (the mouse goes on from
+         * there); a key already held as the ring opens counts as a press. */
+        int slot = -1;
+        const float pl = sqrtf(qx * qx + qy * qy);
+        const int cur = pl >= 0.33f ? ((int)floorf(atan2f(qx, -qy) * (4.0f / 3.14159265f) + 0.5f) + 8) % 8 : -1;
+        for (int k = KB_QS_1; k <= KB_QS_8; k++)
+            if (held[k] && !qs_was[k]) slot = k - KB_QS_1;
+        if (held[KB_QS_NEXT] && !qs_was[KB_QS_NEXT]) slot = cur < 0 ? 0 : (cur + 1) % 8;
+        if (held[KB_QS_PREV] && !qs_was[KB_QS_PREV]) slot = cur < 0 ? 7 : (cur + 7) % 8;
+        for (int k = KB_QS_1; k < KB_N; k++) qs_was[k] = held[k];
+        if (slot >= 0) {
+            const float a = (float)slot * (3.14159265f / 4.0f);   /* clockwise from the top; +y is down */
+            qx = sinf(a); qy = -cosf(a);
+        }
+        if (held[KB_QS_PREV_RING]) btns |= CELL_PAD_CTRL_L1;
+        if (held[KB_QS_NEXT_RING]) btns |= CELL_PAD_CTRL_R1;
+        /* A wheel step arrives in one poll, and the game reads the pad more
+         * than once a frame: the step holds L1 / R1 for 60 ms so it is seen. */
+        static Uint64 wheel_until; static int wheel_dir;
+        const Uint64 now = SDL_GetTicks64();
+        if (wheel) { wheel_dir = wheel > 0 ? 1 : -1; wheel_until = now + 60; }
+        const int wh = now < wheel_until ? wheel_dir : 0;
+        if ((mb & 1u) || wh > 0) btns |= CELL_PAD_CTRL_L1;             /* left click / wheel up: previous ring */
+        if ((mb & 4u) || wh < 0) btns |= CELL_PAD_CTRL_R1;             /* right click / wheel down: next ring */
+    }
+    if (btns || dx || dy || wheel || mb || held[KB_LS_UP] || held[KB_LS_DOWN] || held[KB_LS_LEFT] || held[KB_LS_RIGHT])
+        SDL_AtomicSet(&s_racit_keyboard_prompts, 1);
     hs->buttons |= btns;
     if (btns & CELL_PAD_CTRL_L2) hs->trigger_l2 = 255;
     if (btns & CELL_PAD_CTRL_R2) hs->trigger_r2 = 255;
@@ -1358,23 +1428,44 @@ static void pad_poll_kbm(int ignore_real)
             hs->analog_ly = (u8)(128.0f + 127.0f * m * y / len);
         }
     }
+    /* Quick select pointer: ~150 px of mouse travel (at the default speed)
+     * reaches the ring's edge; past a third of that the left stick points at it. */
+    if (qs_open && !held[KB_LS_UP] && !held[KB_LS_DOWN] && !held[KB_LS_LEFT] && !held[KB_LS_RIGHT]) {
+        if (captured && (dx || dy)) {
+            const float k = (float)opt.mouse_sens / 100.0f / 150.0f;
+            qx += (float)dx * k; qy += (float)dy * k;   /* up is up on the ring, whatever the camera invert says */
+            const float l = sqrtf(qx * qx + qy * qy);
+            if (l > 1.0f) { qx /= l; qy /= l; }
+        }
+        const float l = sqrtf(qx * qx + qy * qy);
+        if (l >= 0.33f) {
+            hs->analog_lx = (u8)(128.0f + 127.0f * qx / l);
+            hs->analog_ly = (u8)(128.0f + 127.0f * qy / l);
+        }
+    }
     /* Right stick: the mouse, else the camera keys. The mouse's speed over the
      * poll becomes a deflection, starting past the game's stick dead zone so
      * a slow move still turns; smoothed over a few polls (mouse reports come
      * in bursts). */
     {
-        struct RacitMouseState { uint64_t epoch_ns; int64_t dx,dy; float x,y; };
-        extern void racit_mouse_step(struct RacitMouseState*,uint64_t,int,int,int,float,int);
-        extern void racit_camera_feed(uint64_t,int,int,int,float,int);
+        /* The follow camera takes the mouse straight (game/desktop_mouse.cpp,
+         * patch_lift step 22), each move used once; other cameras get it as a
+         * stick deflection from its speed, starting past the game's dead zone. */
+        struct RacitMouseState { uint64_t epoch_ns; int64_t dx, dy; float x, y; };
+        extern void racit_mouse_step(struct RacitMouseState*, uint64_t, int, int, int, float, int);
+        extern void racit_camera_feed(uint64_t, int, int, int, float, int);
         extern int racit_camera_follow_active(uint64_t);
         static struct RacitMouseState motion;
-        const uint64_t now_ns=(uint64_t)((double)SDL_GetPerformanceCounter()*1000000000.0/(double)SDL_GetPerformanceFrequency());
-        racit_mouse_step(&motion,now_ns,dx,dy,captured,(float)opt.mouse_sens,opt.mouse_invert);
-        racit_camera_feed(now_ns,dx,dy,captured,(float)opt.mouse_sens,opt.mouse_invert);
-        const int direct_follow=racit_camera_follow_active(now_ns);
-        float rx=direct_follow ? 0.0f : motion.x, ry=direct_follow ? 0.0f : motion.y;
+        const uint64_t now_ns = (uint64_t)((double)SDL_GetPerformanceCounter() * 1000000000.0 / (double)SDL_GetPerformanceFrequency());
+        /* The quick select pointer has the mouse while the ring is open (public PR #42):
+         * neither the stick nor the follow camera turns then. */
+        const int cdx = qs_open ? 0 : dx, cdy = qs_open ? 0 : dy;
+        racit_mouse_step(&motion, now_ns, cdx, cdy, captured, (float)opt.mouse_sens, opt.mouse_invert);
+        racit_camera_feed(now_ns, cdx, cdy, captured, (float)opt.mouse_sens, opt.mouse_invert);
+        const int direct_follow = racit_camera_follow_active(now_ns);
+        float rx = direct_follow ? 0.0f : motion.x, ry = direct_follow ? 0.0f : motion.y;
         const float kx = (float)(held[KB_RS_RIGHT] - held[KB_RS_LEFT]), ky = (float)(held[KB_RS_DOWN] - held[KB_RS_UP]);
-        if (kx || ky) racit_camera_feed(now_ns,0,0,0,(float)opt.mouse_sens,opt.mouse_invert);
+        if (kx || ky) racit_camera_feed(now_ns, 0, 0, 0, (float)opt.mouse_sens, opt.mouse_invert);
         if (!rx && !ry && (kx || ky)) { rx = kx * 0.8f; ry = ky * 0.8f; }
         if (rx || ry) {
             hs->analog_rx = (u8)(128.0f + 127.0f * (rx > 1.0f ? 1.0f : rx < -1.0f ? -1.0f : rx));
@@ -1612,7 +1703,7 @@ static void pad_poll_backend(void)
         const PadHostState* h = &s_host_state[0];
         if (h->connected && (h->buttons || h->analog_lx < 100 || h->analog_lx > 156 ||
             h->analog_ly < 100 || h->analog_ly > 156 || h->analog_rx < 100 || h->analog_rx > 156 ||
-            h->analog_ry < 100 || h->analog_ry > 156)) SDL_AtomicSet(&s_racit_keyboard_prompts,0);
+            h->analog_ry < 100 || h->analog_ry > 156)) SDL_AtomicSet(&s_racit_keyboard_prompts, 0);
     }
     pad_poll_kbm(ign);
 #endif

@@ -388,7 +388,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 #ifdef _WIN32
         SwitchToThread();
 #else
-        { extern void racacit_yield(void); racacit_yield(); }
+        sched_yield();
 #endif
     /* WAITBT_EVERY=<n>: the same dump, but every nth wait per (tid,queue)
      * instead of once. The one-shot above names where a thread FIRST parks,
@@ -418,7 +418,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 #ifdef _WIN32
         SwitchToThread();
 #else
-        { extern void racacit_yield(void); racacit_yield(); }
+        sched_yield();
 #endif
         return (int64_t)(int32_t)CELL_ESRCH;
     }
@@ -1338,7 +1338,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #ifdef _WIN32
         SwitchToThread();
 #else
-        { extern void racacit_yield(void); racacit_yield(); }
+        sched_yield();
 #endif
         return (int64_t)(int32_t)CELL_ESRCH;
     }

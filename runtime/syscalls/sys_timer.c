@@ -569,7 +569,11 @@ int64_t sys_timer_usleep(ppu_context* ctx)
      * each one acknowledges (func_00997840, called from 0x00999868). One poll
      * that comes too early cost the main thread a whole 100 ms: the hitch while
      * playing. Poll every 1 ms there instead; the loop re-checks its flag. */
+#ifdef RACACIT_BCES00511
+    if (usec == 100000 && (uint32_t)ctx->lr == 0x00999E6Cu) usec = 1000;
+#else
     if (usec == 100000 && (uint32_t)ctx->lr == 0x0099986Cu) usec = 1000;
+#endif
 
 #ifdef _WIN32
     /* Use high-resolution sleep via waitable timer for better precision */
