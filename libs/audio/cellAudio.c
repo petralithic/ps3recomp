@@ -103,6 +103,9 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
   #define mutex_unlock(m)  LeaveCriticalSection(m)
 #else
   #include <pthread.h>
+  #ifdef __APPLE__
+  #include <pthread/qos.h>
+  #endif
   #include <unistd.h>
   #include <time.h>
   typedef pthread_t thread_t;
@@ -941,6 +944,14 @@ static void audio_put_hook(uint32_t ea, uint32_t lsa, uint32_t size)
             { static int s_b; if (!s_b) { s_b = 1; const char* e = getenv("RACACIT_AUDIO_BOOST"); const int lv = e ? atoi(e) : 1;
                 if (lv) SetThreadPriority(GetCurrentThread(), lv >= 2 ? THREAD_PRIORITY_HIGHEST : THREAD_PRIORITY_ABOVE_NORMAL);
                 fprintf(stderr, "[cellAudio] audio writer thread %lu, boost %d%c", (unsigned long)GetCurrentThreadId(), lv, 10); } }
+#elif defined(__APPLE__)
+            /* The same on Apple Silicon, where QoS decides P- or E-core: at the
+             * default class the job lost enough time under a 120 fps frame to
+             * finish 184-186 blocks a second, and the output stretched to make up
+             * the rest. Each thread that writes a block, once (SPURS moves jobs
+             * between lanes). RACACIT_AUDIO_BOOST=0 leaves the class alone. */
+            { static _Thread_local int s_b; if (!s_b) { s_b = 1; const char* e = getenv("RACACIT_AUDIO_BOOST");
+                if (!e || atoi(e)) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); } }
 #endif
             s_blk_done[p][blk] = 1; s_port_done_seen[p] = 1;
         }
@@ -1173,6 +1184,9 @@ static void audio_mix_loop(void)
      * little else: a late wake here is a late read index for the whole game. */
 #ifdef _WIN32
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#elif defined(__APPLE__)
+    { const char* e = getenv("RACACIT_AUDIO_BOOST");
+      if (!e || atoi(e)) pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); }
 #endif
 #if AUDIO_BACKEND_SDL2
     ast_init(&s_st);
