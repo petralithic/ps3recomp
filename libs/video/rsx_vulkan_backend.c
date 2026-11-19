@@ -6535,14 +6535,25 @@ static int SDLCALL vk_ap_thread(void* arg)
     return 0;
 }
 
+/* RACACIT_ASYNC_PIPELINES=wait: new pipelines compile on the background
+ * builder and the draw that needs one waits for it -- no draw is skipped, so
+ * no pass is left incomplete -- while the window thread keeps pumping events
+ * (vk_keep_responsive). =1 (the default): skip the draw until it is ready;
+ * =0: compile on the render thread. */
+static int vk_ap_mode(void)
+{
+    static int m = -1;
+    if (m < 0) { const char* e = getenv("RACACIT_ASYNC_PIPELINES");
+                 m = (e && *e == '0') ? 0 : (e && !strcmp(e, "wait")) ? 2 : 1; }
+    return m;
+}
+
 /* Queue a background build (render thread). 0 when it cannot. */
 static int vk_ap_queue(u32 pipe_index, u32 t, VkRenderPass rp)
 {
     if (s_ap.off) return 0;
     if (!s_ap.th) {
-        static int env = -1;
-        if (env < 0) { const char* e = getenv("RACACIT_ASYNC_PIPELINES"); env = !(e && *e == '0'); }
-        if (!env) { s_ap.off = 1; return 0; }
+        if (!vk_ap_mode()) { s_ap.off = 1; return 0; }
         s_ap.mu = SDL_CreateMutex(); s_ap.cv = SDL_CreateCond();
         VkPipelineCacheCreateInfo ci = { .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
         if (pvkCreatePipelineCache(s_vk.device, &ci, NULL, &s_ap.cache) != VK_SUCCESS) s_ap.cache = VK_NULL_HANDLE;
@@ -6586,6 +6597,8 @@ static VkPipeline vk_eng_variant(vk_eng_pipe* P, u32 topo_idx)
 static VkPipeline vk_eng_variant_make(vk_eng_pipe* P, u32 topo_idx)
 {
     if (P->variant[topo_idx]) return P->variant[topo_idx];
+    if (vk_ap_mode() == 2)
+        while (SDL_AtomicGet(&P->pend[topo_idx]) == 1) { vk_keep_responsive(); SDL_Delay(1); }   /* never skipped */
     const int pend = SDL_AtomicGet(&P->pend[topo_idx]);
     if (pend == 1) { P->skipped[topo_idx]++; return VK_NULL_HANDLE; }   /* still compiling */
     if (pend == 2) {                                                    /* the builder is done */
@@ -6627,7 +6640,7 @@ static VkPipeline vk_eng_variant_make(vk_eng_pipe* P, u32 topo_idx)
      * stall behind a 164 ms compile). The new one joins the queue; a cached
      * one is made there within a frame or two. */
     if (s_vk_pcc && s_ap.th && SDL_AtomicGet(&s_ap.active) > 0 && vk_ap_queue((u32)(P - s_epipe), topo_idx, rp)) {
-        return VK_NULL_HANDLE;
+        return vk_ap_mode() == 2 ? vk_eng_variant(P, topo_idx) : VK_NULL_HANDLE;
     }
     if (s_vk_pcc && !s_ap.off) {
         /* In the pipeline cache: made now. Not: compiled in the background. */
@@ -6640,7 +6653,7 @@ static VkPipeline vk_eng_variant_make(vk_eng_pipe* P, u32 topo_idx)
         }
         P->variant[topo_idx] = VK_NULL_HANDLE;
         if (rc == VK_PIPELINE_COMPILE_REQUIRED_EXT && vk_ap_queue((u32)(P - s_epipe), topo_idx, rp)) {
-            return VK_NULL_HANDLE;
+            return vk_ap_mode() == 2 ? vk_eng_variant(P, topo_idx) : VK_NULL_HANDLE;
         }
     }
     const VkResult r = vk_vdesc_build(&d, P->vs, P->fs, rp, &P->variant[topo_idx], 0, s_g.pcache);
