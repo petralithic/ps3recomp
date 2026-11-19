@@ -194,7 +194,33 @@ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
  * A port the game does not fill by SPU PUT (no s_port_done_seen) reads on as it
  * always did, with pub_index = read_index. */
 #define AUDIO_DEV_BLOCKS 4u         /* in the device's queue: 21 ms */
-static u32 s_q_target = 6;          /* blocks wanted in the stretcher beyond its frame: 6 (32 ms), +2 per dropout with sound, up to 24 (128 ms) */
+/* macOS: the whole process stops for 20-60 ms at a hitch (a shader compile, a
+ * load), the mixing thread with it. 21 ms in the device then ran out: a hole,
+ * and the blocks that piled up meanwhile were played 3% fast to catch up --
+ * compressed 90% of the time at 120 fps. Here the device may hold up to
+ * AUDIO_DEV_MAX_BLOCKS and is kept at AUDIO_DEV_MIN0 or more: what the
+ * stretcher has beyond its next hop goes on to it, and the level that sets the
+ * ratio counts both. A stall plays on from the device. */
+#ifdef __APPLE__
+#define AUDIO_DEV_MAX_BLOCKS 20u    /* 107 ms */
+#define AUDIO_DEV_MIN0 8u           /* always in the device: 43 ms, even when the game is short */
+#define AUDIO_Q_TARGET0 6u          /* in hand beyond that: 32 ms */
+#else
+#define AUDIO_DEV_MAX_BLOCKS AUDIO_DEV_BLOCKS
+#define AUDIO_DEV_MIN0 AUDIO_DEV_BLOCKS
+#define AUDIO_Q_TARGET0 6u
+#endif
+static u32 s_q_target = AUDIO_Q_TARGET0;
+static u32 s_q_base = AUDIO_Q_TARGET0;     /* where a quiet minute brings s_q_target back to */
+static u32 s_dev_min = AUDIO_DEV_MIN0;     /* blocks the device is kept topped up to */
+/* RACACIT_AUDIO_LEGACY=1: the output as before the deeper macOS device queue
+ * (for A/B tests). */
+static int s_audio_legacy = -1;
+static int audio_legacy(void)
+{
+    if (s_audio_legacy < 0) { const char* e = getenv("RACACIT_AUDIO_LEGACY"); s_audio_legacy = e && *e == '1'; }
+    return s_audio_legacy;
+}          /* blocks wanted in the stretcher beyond its frame: 6 (32 ms), +2 per dropout with sound, up to 24 (128 ms) */
 static atomic_uint s_finished[CELL_AUDIO_PORT_MAX];   /* blocks the game has finished, ever */
 static unsigned s_pub_steps;        /* for the 30 s report */
 static int s_pub_mode;              /* the above is on (a device is open; not RACACIT_AUDIO_NOWAIT) */
@@ -501,12 +527,12 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
     }
 }
 
-/* SDL queues without bound: keep AUDIO_DEV_BLOCKS ahead of the device. */
+/* SDL queues without bound: keep s_dev_min blocks ahead of the device. */
 static int audio_backend_room(void)
 {
     if (!s_sdl_audio_dev) return -1;
     return SDL_GetQueuedAudioSize(s_sdl_audio_dev) / (2 * sizeof(float)) <
-           CELL_AUDIO_BLOCK_SAMPLES * AUDIO_DEV_BLOCKS ? CELL_AUDIO_BLOCK_SAMPLES : 0;
+           CELL_AUDIO_BLOCK_SAMPLES * s_dev_min ? CELL_AUDIO_BLOCK_SAMPLES : 0;
 }
 
 static void audio_backend_wait(void) { SDL_Delay(1); }
@@ -1035,7 +1061,7 @@ static void audio_late_report(void)
         fprintf(stderr, "[cellAudio] in the last 30 s: stretched %u%% of the time, %u dropouts, %u jumps, game finished %.1f blocks/s, read index %.1f/s (in hand %u blocks)%c",
                 n ? (unsigned)(st * 100u / n) : 0u, s_late_fades, s_late_skips, (finished - f0) / sec, s_pub_steps / sec, s_q_target, 10);
     quiet = s_late_fades ? 0 : quiet + 1;
-    if (quiet >= 2 && s_q_target > 6) { s_q_target -= 2; quiet = 0; }
+    if (quiet >= 2 && s_q_target > s_q_base) { s_q_target -= 2; quiet = 0; }
     s_late_skips = s_late_fades = 0; s_pub_steps = 0;
     f0 = finished; st0 = s_st.stretched_steps; n0 = s_st.steps;
     t0 = t;
@@ -1114,7 +1140,7 @@ static void audio_pub_tick(void)
         double step = block_us;
         if (any) {
             const double level = (double)audio_backend_queued_samples() / CELL_AUDIO_BLOCK_SAMPLES + audio_st_blocks() + unread;
-            const double want = (double)s_q_target + AUDIO_DEV_BLOCKS;
+            const double want = (double)s_q_target + s_dev_min;
             ema += (level - ema) / 32.0;
             if (ema < want - 2.0 && max_lag < 0) step *= 0.99;
             else if (ema > want + 5.0) step *= 1.01;
@@ -1159,13 +1185,38 @@ static int audio_output_stretched(void)
     static float out[CELL_AUDIO_BLOCK_SAMPLES * 2];
     static double smooth = 1.0;
     static int filling;
-    const double have = audio_st_blocks(), err = (double)s_q_target - have;
-    if (have < 1.0) filling = 1; else if (err <= 0.0) filling = 0;
+    double have = audio_st_blocks();
+#if AUDIO_DEV_MAX_BLOCKS > AUDIO_DEV_BLOCKS
+    if (!audio_legacy()) { const double dq = (double)audio_backend_queued_samples() / CELL_AUDIO_BLOCK_SAMPLES;
+      if (dq > s_dev_min) have += dq - s_dev_min; }
+#endif
+    const double err = (double)s_q_target - have;
     double r = 1.0;
+#ifdef __APPLE__
+    /* After a hitch the game writes its backlog in one burst, then runs short
+     * again: answering each instant (0.97 on the burst, up to 1.8 from dry back
+     * to the target) kept the ratio off 1 most of the time, the stretching that
+     * is heard. Here a burst is just buffer: play fast only when the level stays
+     * high (a third of a second on average), and from dry stretch gently and only
+     * out of the dry zone -- the read index's 1% lean (audio_pub_tick) refills
+     * the rest through the game at ratio 1. */
+    (void)err;
+    if (!audio_legacy()) { static double slow;
+      slow += (have - slow) / 64.0;
+      if (have < 1.0) filling = 1; else if (have >= 4.0) filling = 0;
+      if (filling) r = 1.03 + (4.0 - have) * 0.05;
+      else if (slow - s_q_target > 20.0) r = 0.95;
+      else if (slow - s_q_target > 8.0) r = 0.98;
+      if (r > 1.25) r = 1.25; }
+    else
+#endif
+    {
+    if (have < 1.0) filling = 1; else if (err <= 0.0) filling = 0;
     if (filling) r = 1.02 + (err > 0.0 ? err : 0.0) * 0.1;
     else if (err < -20.0) r = 0.92;
     else if (err < -6.0) r = 0.97;
     if (r > 1.8) r = 1.8;
+    }
     smooth += (r - smooth) * 0.1;
     if (r == 1.0 && fabs(smooth - 1.0) < 0.01) smooth = 1.0;
     ast_set_ratio(&s_st, smooth);
@@ -1190,6 +1241,7 @@ static void audio_mix_loop(void)
 #endif
 #if AUDIO_BACKEND_SDL2
     ast_init(&s_st);
+    if (audio_legacy()) { s_q_target = s_q_base = 6; s_dev_min = AUDIO_DEV_BLOCKS; }
 #endif
 
 #ifdef _WIN32
@@ -1228,6 +1280,13 @@ static void audio_mix_loop(void)
             audio_feed_stretcher();
             audio_late_report();
             while (audio_backend_room() > 0 && audio_output_stretched()) {}
+#if AUDIO_DEV_MAX_BLOCKS > AUDIO_DEV_BLOCKS
+            /* Beyond the minimum, only what the stretcher holds past a hop and a
+             * block: those steps are exact, ratio 1, no search. */
+            while (!audio_legacy() && audio_st_blocks() >= 3.0 &&
+                   audio_backend_queued_samples() < CELL_AUDIO_BLOCK_SAMPLES * AUDIO_DEV_MAX_BLOCKS &&
+                   audio_output_stretched()) {}
+#endif
             audio_backend_wait();
             continue;
         }
